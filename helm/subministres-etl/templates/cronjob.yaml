@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "subministres-etl.fullname" . }}
+  labels:
+    {{- include "subministres-etl.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.schedule | quote }}
+  concurrencyPolicy: {{ .Values.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "subministres-etl.selectorLabels" . | nindent 12 }}
+        spec:
+          restartPolicy: {{ .Values.restartPolicy }}
+          serviceAccountName: {{ default (include "subministres-etl.fullname" .) .Values.serviceAccount.name }}
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: {{ .Chart.Name }}
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              {{- if .Values.args }}
+              args:
+                {{- toYaml .Values.args | nindent 16 }}
+              {{- end }}
+              envFrom:
+                - configMapRef:
+                    name: {{ include "subministres-etl.fullname" . }}-config
+                {{- if .Values.existingSecret }}
+                - secretRef:
+                    name: {{ .Values.existingSecret }}
+                    optional: true
+                {{- end }}
+              {{- if .Values.persistence.enabled }}
+              volumeMounts:
+                - name: factures-storage
+                  mountPath: {{ .Values.persistence.mountPath }}
+              {{- end }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+          {{- if .Values.persistence.enabled }}
+          volumes:
+            - name: factures-storage
+              persistentVolumeClaim:
+                claimName: {{ .Values.persistence.existingClaim }}
+          {{- end }}

@@ -1,0 +1,9 @@
+---
+apiVersion: v2
+name: subministres-etl
+description: >-
+  Helm chart per a l'ETL de factures de subministraments
+  (Aigua, Gas, Llum, Telefonia) a K3s.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

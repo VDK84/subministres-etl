@@ -1,0 +1,58 @@
+---
+# Default values for subministres-etl.
+image:
+  repository: ghcr.io/vdk84/subministres-etl
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+schedule: "0 6 * * *"
+concurrencyPolicy: "Forbid"
+successfulJobsHistoryLimit: 3
+failedJobsHistoryLimit: 3
+restartPolicy: "OnFailure"
+
+args:
+  - "--days-back"
+  - "60"
+
+env:
+  LOG_LEVEL: "INFO"
+  DRY_RUN: "false"
+  NAS_MOUNT_PATH: "/data/factures"
+  DAYS_BACK: "60"
+  IMAP_ENABLED: "true"
+  IMAP_HOST: "imap.gmail.com"
+  IMAP_PORT: "993"
+  IMAP_FOLDER: "INBOX"
+  INFLUXDB_ENABLED: "true"
+  INFLUXDB_URL: "http://influxdb2.influxdb.svc.cluster.local:80"
+  INFLUXDB_ORG: "home_assistant"
+  INFLUXDB_BUCKET: "energy_data"
+  VEOLIA_ENABLED: "true"
+  CATGAS_ENABLED: "true"
+  BONPREU_ENABLED: "true"
+  DIGI_ENABLED: "true"
+  HEADLESS_BROWSER: "true"
+
+existingSecret: "subministres-etl-secrets"
+
+persistence:
+  enabled: true
+  existingClaim: "pvc-samba-factures-rw"
+  mountPath: "/data/factures"
+
+resources:
+  limits:
+    cpu: "1000m"
+    memory: "1536Mi"
+  requests:
+    cpu: "100m"
+    memory: "256Mi"
+
+serviceAccount:
+  create: true
+  name: ""
