@@ -141,11 +141,13 @@ class ImapMailboxClient:
                 if "attachment" in content_disposition.lower() or (filename and filename.lower().endswith(".pdf")):
                     payload = part.get_payload(decode=True)
                     if isinstance(payload, bytes):
-                        attachments.append(EmailAttachment(
-                            filename=filename or f"adjunt_{msg_id}.pdf",
-                            content_type=content_type,
-                            data=payload,
-                        ))
+                        attachments.append(
+                            EmailAttachment(
+                                filename=filename or f"adjunt_{msg_id}.pdf",
+                                content_type=content_type,
+                                data=payload,
+                            )
+                        )
                 elif content_type in ("text/plain", "text/html") and "attachment" not in content_disposition.lower():
                     payload = part.get_payload(decode=True)
                     if isinstance(payload, bytes):

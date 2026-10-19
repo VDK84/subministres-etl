@@ -134,7 +134,9 @@ class DigiConnector(BaseConnector):
                         page.wait_for_load_state("networkidle")
 
                 # Cerca botons de descàrrega
-                download_buttons = page.query_selector_all("a[href*='.pdf'], button:has-text('Descargar'), a:has-text('PDF')")
+                download_buttons = page.query_selector_all(
+                    "a[href*='.pdf'], button:has-text('Descargar'), a:has-text('PDF')"
+                )
                 self.logger.info(f"Trobats {len(download_buttons)} enllaços de factura a Mi Digi")
 
                 for i, btn in enumerate(download_buttons[:3]):
@@ -164,16 +166,22 @@ class DigiConnector(BaseConnector):
             return None
 
         # 1. Número de factura (ex: Factura: 2026/DIGI/01234 o Número: FA26001234)
-        num_factura = extract_regex_first(text, r"(?:Factura\s*n[úu]m\.?|N[úu]mero\s*de\s*factura:?)\s*([A-Za-z0-9/_-]+)")
+        num_factura = extract_regex_first(
+            text, r"(?:Factura\s*n[úu]m\.?|N[úu]mero\s*de\s*factura:?)\s*([A-Za-z0-9/_-]+)"
+        )
         if not num_factura:
             num_factura = extract_regex_first(text, r"Factura\s+([A-Za-z0-9/_-]{6,20})")
 
         # 2. Data d'emissió
-        data_str = extract_regex_first(text, r"(?:Fecha\s*de\s*emisi[óo]n|Data\s*d'emissi[óo]):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})")
+        data_str = extract_regex_first(
+            text, r"(?:Fecha\s*de\s*emisi[óo]n|Data\s*d'emissi[óo]):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+        )
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
 
         # 3. Import total
-        total_eur = extract_float_value(text, r"(?:Total\s*a\s*pagar|Total\s*factura|Import\s*total):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?")
+        total_eur = extract_float_value(
+            text, r"(?:Total\s*a\s*pagar|Total\s*factura|Import\s*total):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
+        )
         if total_eur is None:
             total_eur = parse_euro_amount(text)
 
@@ -181,7 +189,10 @@ class DigiConnector(BaseConnector):
             return None
 
         # 4. Període facturat
-        periode_raw = extract_regex_first(text, r"(?:Per[íi]odo\s*de\s*facturaci[óo]n|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:al|a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})")
+        periode_raw = extract_regex_first(
+            text,
+            r"(?:Per[íi]odo\s*de\s*facturaci[óo]n|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:al|a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        )
         dt_inici: date | None = None
         dt_fi: date | None = None
         if periode_raw:

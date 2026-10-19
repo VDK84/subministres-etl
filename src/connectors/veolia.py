@@ -73,11 +73,15 @@ class VeoliaConnector(BaseConnector):
             num_factura = extract_regex_first(text, r"Factura\s+([A-Za-z0-9/_-]{6,20})")
 
         # 2. Data d'emissió
-        data_str = extract_regex_first(text, r"(?:Data\s*d'emissi[óo]|Fecha\s*emisi[óo]n):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})")
+        data_str = extract_regex_first(
+            text, r"(?:Data\s*d'emissi[óo]|Fecha\s*emisi[óo]n):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+        )
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
 
         # 3. Import total
-        total_eur = extract_float_value(text, r"(?:Total\s*factura|Import\s*total|Total\s*a\s*pagar):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?")
+        total_eur = extract_float_value(
+            text, r"(?:Total\s*factura|Import\s*total|Total\s*a\s*pagar):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
+        )
         if total_eur is None:
             total_eur = parse_euro_amount(text)
 
@@ -87,12 +91,17 @@ class VeoliaConnector(BaseConnector):
 
         # 4. Consum d'aigua en m3
         # Exemples: "Consum facturat: 12 m3" o "Consum del període: 14 m³"
-        consum_m3 = extract_float_value(text, r"(?:Consum\s*facturat|Consumo\s*facturado|Consum\s*per[íi]ode):?\s*(\d+(?:[.,]\d{1,2})?)\s*m[3³]")
+        consum_m3 = extract_float_value(
+            text, r"(?:Consum\s*facturat|Consumo\s*facturado|Consum\s*per[íi]ode):?\s*(\d+(?:[.,]\d{1,2})?)\s*m[3³]"
+        )
         if consum_m3 is None:
             consum_m3 = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*m[3³]")
 
         # 5. Dates del període
-        periode_raw = extract_regex_first(text, r"(?:Per[íi]ode\s*facturat|Per[íi]odo):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:a|fins\s*a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})")
+        periode_raw = extract_regex_first(
+            text,
+            r"(?:Per[íi]ode\s*facturat|Per[íi]odo):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:a|fins\s*a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        )
         dt_inici: date | None = None
         dt_fi: date | None = None
         if periode_raw:

@@ -65,16 +65,22 @@ class CatgasConnector(BaseConnector):
             return None
 
         # 1. Número de factura (ex: Factura núm: FG2026/001234)
-        num_factura = extract_regex_first(text, r"(?:Factura\s*n[úu]m\.?|N[úu]mero\s*de\s*factura:?)\s*([A-Za-z0-9/_-]+)")
+        num_factura = extract_regex_first(
+            text, r"(?:Factura\s*n[úu]m\.?|N[úu]mero\s*de\s*factura:?)\s*([A-Za-z0-9/_-]+)"
+        )
         if not num_factura:
             num_factura = extract_regex_first(text, r"(FG\d{4}[/-]?\d+)")
 
         # 2. Data d'emissió
-        data_str = extract_regex_first(text, r"(?:Data\s*emissi[óo]|Fecha\s*emisi[óo]n):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})")
+        data_str = extract_regex_first(
+            text, r"(?:Data\s*emissi[óo]|Fecha\s*emisi[óo]n):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+        )
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
 
         # 3. Import total
-        total_eur = extract_float_value(text, r"(?:Total\s*factura|Import\s*total|Total\s*a\s*pagar):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?")
+        total_eur = extract_float_value(
+            text, r"(?:Total\s*factura|Import\s*total|Total\s*a\s*pagar):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
+        )
         if total_eur is None:
             total_eur = parse_euro_amount(text)
 
@@ -82,14 +88,19 @@ class CatgasConnector(BaseConnector):
             return None
 
         # 4. Consum de gas en kWh i m3
-        consum_kwh = extract_float_value(text, r"(?:Consum\s*facturat|Consumo|Energia\s*facturada):?\s*(\d+(?:[.,]\d{1,2})?)\s*kWh")
+        consum_kwh = extract_float_value(
+            text, r"(?:Consum\s*facturat|Consumo|Energia\s*facturada):?\s*(\d+(?:[.,]\d{1,2})?)\s*kWh"
+        )
         if consum_kwh is None:
             consum_kwh = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*kWh")
 
         consum_m3 = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*m[3³]")
 
         # 5. Dates del període
-        periode_raw = extract_regex_first(text, r"(?:Per[íi]ode\s*de\s*facturaci[óo]|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:fins\s*a|a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})")
+        periode_raw = extract_regex_first(
+            text,
+            r"(?:Per[íi]ode\s*de\s*facturaci[óo]|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:fins\s*a|a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        )
         dt_inici: date | None = None
         dt_fi: date | None = None
         if periode_raw:

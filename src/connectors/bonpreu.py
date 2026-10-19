@@ -124,7 +124,9 @@ class BonpreuConnector(BaseConnector):
 
                 # Omplir formulari de credencials
                 # Selectors típics de formulari (email / dni i contrasenya)
-                page.fill("input[type='email'], input[name='username'], input[name='login']", settings.BONPREU_USER or "")
+                page.fill(
+                    "input[type='email'], input[name='username'], input[name='login']", settings.BONPREU_USER or ""
+                )
                 page.fill("input[type='password'], input[name='password']", settings.BONPREU_PASSWORD or "")
                 page.click("button[type='submit'], input[type='submit']")
 
@@ -139,7 +141,9 @@ class BonpreuConnector(BaseConnector):
                         page.wait_for_load_state("networkidle")
 
                 # Cerca botons de descàrrega de PDF
-                download_buttons = page.query_selector_all("a[href*='.pdf'], button:has-text('Descarregar'), a:has-text('PDF')")
+                download_buttons = page.query_selector_all(
+                    "a[href*='.pdf'], button:has-text('Descarregar'), a:has-text('PDF')"
+                )
                 self.logger.info(f"Trobats {len(download_buttons)} enllaços de descàrrega de factura")
 
                 for i, btn in enumerate(download_buttons[:3]):  # Limitem a les últimes 3
@@ -156,7 +160,9 @@ class BonpreuConnector(BaseConnector):
 
                 browser.close()
         except ImportError:
-            self.logger.warning("Playwright no està instal·lat en aquest entorn. Cal instal·lar el paquet per fer scraping.")
+            self.logger.warning(
+                "Playwright no està instal·lat en aquest entorn. Cal instal·lar el paquet per fer scraping."
+            )
         except (TimeoutError, OSError, RuntimeError) as e:
             self.logger.error(f"Error durant el web scraping de Bonpreu: {e}")
 
@@ -174,11 +180,15 @@ class BonpreuConnector(BaseConnector):
             num_factura = extract_regex_first(text, r"Factura\s+([0-9]{4}E[0-9]+)")
 
         # 2. Data d'emissió
-        data_str = extract_regex_first(text, r"(?:Data\s*emissi[óo]|Fecha\s*emisi[óo]n):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})")
+        data_str = extract_regex_first(
+            text, r"(?:Data\s*emissi[óo]|Fecha\s*emisi[óo]n):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+        )
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
 
         # 3. Import total
-        total_eur = extract_float_value(text, r"(?:Total\s*factura|Import\s*total|Total\s*a\s*pagar):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?")
+        total_eur = extract_float_value(
+            text, r"(?:Total\s*factura|Import\s*total|Total\s*a\s*pagar):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
+        )
         if total_eur is None:
             total_eur = parse_euro_amount(text)
 
@@ -186,7 +196,9 @@ class BonpreuConnector(BaseConnector):
             return None
 
         # 4. Consums d'electricitat en kWh (Total i per períodes)
-        consum_total = extract_float_value(text, r"(?:Consum\s*total|Energia\s*consumida|Total\s*consum):?\s*(\d+(?:[.,]\d{1,2})?)\s*kWh")
+        consum_total = extract_float_value(
+            text, r"(?:Consum\s*total|Energia\s*consumida|Total\s*consum):?\s*(\d+(?:[.,]\d{1,2})?)\s*kWh"
+        )
         p1 = extract_float_value(text, r"(?:Punta|P1)[:\s]+(\d+(?:[.,]\d{1,2})?)\s*kWh")
         p2 = extract_float_value(text, r"(?:Pla|Llano|P2)[:\s]+(\d+(?:[.,]\d{1,2})?)\s*kWh")
         p3 = extract_float_value(text, r"(?:Vall|Valle|P3)[:\s]+(\d+(?:[.,]\d{1,2})?)\s*kWh")
@@ -198,7 +210,10 @@ class BonpreuConnector(BaseConnector):
         potencia = extract_float_value(text, r"(?:Pot[èe]ncia\s*contractada|Potencia):?\s*(\d+(?:[.,]\d{1,2})?)\s*kW")
 
         # 6. Període facturat
-        periode_raw = extract_regex_first(text, r"(?:Per[íi]ode\s*facturat|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:a|fins\s*a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})")
+        periode_raw = extract_regex_first(
+            text,
+            r"(?:Per[íi]ode\s*facturat|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:a|fins\s*a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        )
         dt_inici: date | None = None
         dt_fi: date | None = None
         if periode_raw:

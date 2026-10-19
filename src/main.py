@@ -107,7 +107,9 @@ def run_etl(connector_filter: str | None = None) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ETL Subministres - Extracció de factures per a NAS i InfluxDB")
-    parser.add_argument("--connector", type=str, help="Executar només un connector específic (veolia, catgas, bonpreu, digi)")
+    parser.add_argument(
+        "--connector", type=str, help="Executar només un connector específic (veolia, catgas, bonpreu, digi)"
+    )
     parser.add_argument("--days-back", type=int, help="Nombre de dies enrere per buscar correus/factures")
     parser.add_argument("--dry-run", action="store_true", help="Simulació: no guarda fitxers ni escriu a InfluxDB")
     parser.add_argument("--log-level", type=str, default="INFO", help="Nivell de logging (DEBUG, INFO, WARNING, ERROR)")
