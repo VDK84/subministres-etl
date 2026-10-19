@@ -4,7 +4,8 @@ FROM python:3.11-slim
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    APP_HOST=0.0.0.0
 
 WORKDIR /app
 
@@ -19,17 +20,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copiar requirements i instal·lar
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && playwright install --with-deps chromium \
+    && mkdir -p /data/factures && chmod 777 /data/factures
 
-# Instal·lar navegador headless per a scrapers (Chromium) amb dependències del sistema
-RUN playwright install --with-deps chromium
+EXPOSE 8000
 
-# Copiar codi font
-COPY src/ ./src/
-COPY pyproject.toml .
-
-# Crear directori de dades per al volum NAS
-RUN mkdir -p /data/factures && chmod 777 /data/factures
-
-ENTRYPOINT ["python", "-m", "src.main"]
-CMD ["--days-back", "60"]
+CMD ["uvicorn", "src.web.app:app", "--host", "0.0.0.0", "--port", "8000"]

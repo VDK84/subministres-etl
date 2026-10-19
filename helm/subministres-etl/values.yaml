@@ -9,15 +9,32 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
+# Mode: "deployment" (Web UI + API) o "cronjob" (Batch periòdic)
+mode: "deployment"
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 8000
+
+ingress:
+  enabled: true
+  className: traefik
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+  hosts:
+    - host: subministres.rusc.local
+      paths:
+        - path: /
+          pathType: Prefix
+
+# Config per a mode cronjob si mode == "cronjob"
 schedule: "0 6 * * *"
 concurrencyPolicy: "Forbid"
 successfulJobsHistoryLimit: 3
 failedJobsHistoryLimit: 3
 restartPolicy: "OnFailure"
-
-args:
-  - "--days-back"
-  - "60"
 
 env:
   LOG_LEVEL: "INFO"
@@ -37,6 +54,7 @@ env:
   BONPREU_ENABLED: "true"
   DIGI_ENABLED: "true"
   HEADLESS_BROWSER: "true"
+  APP_HOST: "0.0.0.0"
 
 existingSecret: "subministres-etl-secrets"
 

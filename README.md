@@ -121,6 +121,28 @@ kubectl logs -f job/subministres-etl-manual-01 -n subministres
 
 ---
 
+## 🖥️ Interfície Web Operativa (Fase 2)
+
+L'aplicació incorpora una interfície web ultralleugera (FastAPI + HTMX + Tailwind CSS) per a la gestió interactiva:
+
+- **Sincronització sota demanda**: Botó "Sincronitzar Tot" o sincronització independent per proveïdor (Veolia, Catgas, Bonpreu, Digi) sense obrir terminals ni esperar el cron.
+- **Pujada manual de factures (Dropzone / Drag & Drop)**: Permet arrossegar un PDF descarregat manualment; el sistema en detecta el proveïdor, n'extreu automàticament les dades, el guarda al NAS Samba i injecta les mètriques a InfluxDB.
+- **Explorador de Factures al NAS**: Taula interactiva amb cercador, botó de descàrrega directa i **visor de PDF integrat en finestra modal** sense haver de muntar la unitat SMB al dispositiu.
+- **Consola de Logs en directe**: Terminal integrada amb actualització automàtica cada 3 segons (polling HTMX) per seguir el progrés de l'scraping o detectar avisos de sessió.
+
+### Endpoints de l'API Web
+
+| Mètode | Endpoint | Descripció |
+| :--- | :--- | :--- |
+| `GET` | `/` | Pàgina principal del panell de control |
+| `POST` | `/api/sync` | Dispara sincronització en background (`connector` opcional) |
+| `GET` | `/api/logs` | Fragment HTML amb els darrers logs per a polling HTMX |
+| `POST` | `/api/upload` | Pujada multipart d'un fitxer PDF i processament immediat |
+| `GET` | `/api/pdf/view/{path}` | Serveix el fitxer PDF amb capçalera `inline` per al visor |
+| `GET` | `/api/pdf/download/{path}` | Descarrega el fitxer PDF directament |
+
+---
+
 ## 🚀 Execució Local i Desenvolupament
 
 ```bash
@@ -132,10 +154,11 @@ pip install -r requirements.txt
 # 2. Instal·lar el navegador Chromium headless per a Playwright
 playwright install chromium
 
-# 3. Execució en mode prova (dry-run)
-python -m src.main --dry-run --days-back 30
+# 3. Execució del Servidor Web (FastAPI + Uvicorn)
+uvicorn src.web.app:app --host 127.0.0.1 --port 8000 --reload
 
-# 4. Execució d'un sol connector
+# 4. Execució en mode CLI pur (per lots / dry-run)
+python -m src.main --dry-run --days-back 30
 python -m src.main --connector bonpreu --dry-run
 ```
 

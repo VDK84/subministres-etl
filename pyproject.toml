@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "subministres-etl"
-version = "0.1.0"
-description = "ETL de factures de subministraments domèstics (Aigua, Gas, Llum, Telefonia) per desar a NAS i InfluxDB"
+version = "0.2.0"
+description = "ETL i interfície web de gestió de factures de subministraments (Aigua, Gas, Llum, Telefonia) per desar a NAS i InfluxDB"
 authors = [{ name = "VDK84" }]
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,10 +22,15 @@ dependencies = [
     "rich>=13.7.1",
     "python-dateutil>=2.9.0",
     "tenacity>=8.3.0",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.28.0",
+    "jinja2>=3.1.3",
+    "python-multipart>=0.0.9",
 ]
 
 [project.scripts]
 subministres-etl = "src.main:main"
+subministres-web = "src.web.app:start"
 
 [tool.pyright]
 reportMissingImports = false

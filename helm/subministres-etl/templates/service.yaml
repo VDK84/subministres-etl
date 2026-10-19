@@ -1,0 +1,17 @@
+{{- if eq .Values.mode "deployment" -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "subministres-etl.fullname" . }}
+  labels:
+    {{- include "subministres-etl.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: 8000
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "subministres-etl.selectorLabels" . | nindent 4 }}
+{{- end }}
