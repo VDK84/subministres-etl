@@ -78,15 +78,17 @@ def list_nas_invoices() -> list[dict[str, Any]]:
             proveidor = parts[1] if len(parts) > 1 else "desconegut"
             any_str = parts[2] if len(parts) > 2 else ""
 
-            invoices.append({
-                "filename": pdf_path.name,
-                "tipus": tipus,
-                "proveidor": proveidor,
-                "any": any_str,
-                "size_kb": round(stat.st_size / 1024, 1),
-                "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
-                "rel_path": str(rel_path).replace("\\", "/"),
-            })
+            invoices.append(
+                {
+                    "filename": pdf_path.name,
+                    "tipus": tipus,
+                    "proveidor": proveidor,
+                    "any": any_str,
+                    "size_kb": round(stat.st_size / 1024, 1),
+                    "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                    "rel_path": str(rel_path).replace("\\", "/"),
+                }
+            )
         except OSError:
             continue
 
@@ -206,7 +208,7 @@ async def trigger_sync(background_tasks: BackgroundTasks, connector: str = Form(
     if execution_state["is_running"]:
         return HTMLResponse(
             '<div class="p-4 mb-4 text-sm text-yellow-800 rounded-lg bg-yellow-50 dark:bg-gray-800 dark:text-yellow-300" role="alert">'
-            'Ja hi ha una sincronització en curs. Si us plau, espera que finalitzi.</div>'
+            "Ja hi ha una sincronització en curs. Si us plau, espera que finalitzi.</div>"
         )
 
     target = connector.strip() if connector else None
@@ -215,7 +217,7 @@ async def trigger_sync(background_tasks: BackgroundTasks, connector: str = Form(
     target_desc = f"del proveïdor {target.upper()}" if target else "de tots els proveïdors"
     return HTMLResponse(
         f'<div class="p-4 mb-4 text-sm text-green-800 rounded-lg bg-green-50 dark:bg-gray-800 dark:text-green-400" role="alert">'
-        f'🚀 Sincronització iniciada {target_desc} en segon pla. Els logs s\'estan actualitzant a continuació.</div>'
+        f"🚀 Sincronització iniciada {target_desc} en segon pla. Els logs s'estan actualitzant a continuació.</div>"
     )
 
 
@@ -241,7 +243,7 @@ async def get_logs_fragment():
     if execution_state["is_running"]:
         is_running_badge = (
             f'<div class="mb-2 inline-flex items-center gap-2 px-2.5 py-1 text-xs font-medium text-blue-400 bg-blue-950/60 rounded border border-blue-800 animate-pulse">'
-            f'<span>Executant {execution_state["active_connector"]}...</span></div>'
+            f"<span>Executant {execution_state['active_connector']}...</span></div>"
         )
 
     return HTMLResponse(is_running_badge + "".join(html_lines))
@@ -282,7 +284,7 @@ async def upload_invoice_pdf(
     msg = f"Factura '{file.filename}' processada i desada correctament al NAS Samba per a {proveidor.upper()}."
     return HTMLResponse(
         f'<div class="p-4 text-sm text-green-800 rounded-lg bg-green-50 dark:bg-gray-800 dark:text-green-400">'
-        f'✅ {msg} (Total: {metriques.import_total:.2f} €)</div>'
+        f"✅ {msg} (Total: {metriques.import_total:.2f} €)</div>"
     )
 
 
@@ -318,6 +320,7 @@ async def download_pdf(rel_path: str):
 def start() -> None:
     """Punt d'entrada per executar el servidor web FastAPI amb Uvicorn."""
     import os
+
     bind_host = os.getenv("APP_HOST", "127.0.0.1")
     uvicorn.run("src.web.app:app", host=bind_host, port=8000, reload=False)
 
