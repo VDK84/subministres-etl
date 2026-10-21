@@ -26,7 +26,13 @@ L'aplicació implementa una estratègia híbrida intel·ligent que optimitza rec
 3. **Trigger per correu + Scraping web del portal de clients**:
    - **Bonpreu Esclat Energia (Electricitat)**: Bonpreu només notifica l'import i emissió per correu sense adjuntar el PDF.
    - **Digi Mobil (Telefonia / Fibra)**: Digi no envia la factura en PDF per correu, només avisa de l'import mensual.
-   - *Flux*: La recepció del correu d'avís funciona com a disparador (trigger). El connector s'autentica al portal privat de clients (`https://clients.energia.bonpreu.cat/` o `https://mi.digimobil.es/`) mitjançant **Playwright** (Chromium headless), descarrega el PDF oficial, en parseja el detall (per exemple el desglossament P1/P2/P3 de llum o gigues de mòbil) i l'emmagatzema.
+   - *Flux*: La recepció del correu d'avís funciona com a disparador (trigger). El connector utilitza **Playwright** (Chromium headless) per connectar als portals oficials (`https://www.bonpreuesclat.cat/energia` o `https://midigi.digimobil.es/`), descarregar el PDF oficial, parsejar-ne el detall (desglossament P1/P2/P3 o gigues de mòbil) i emmagatzemar-lo al NAS.
+
+4. **Persistència de Sessió al NAS i Gestió de 2FA (Zero Bloquejos)**:
+   - **Sessió persistent (`storage_state`)**: Les cookies i tokens de sessió dels portals es guarden al NAS a `/data/factures/.sessions/`. D'aquesta manera, les execucions periòdiques entren directament a l'àrea de factures sense tornar a fer login ni demanar 2FA durant setmanes o mesos.
+   - **Detecció de 2FA**: Quan la sessió caduca i el portal sol·licita verificació en dos passos (SMS/Email), el sistema **no insisteix ni entra en bucle**. Desa una captura de seguretat a `.sessions/digi_2fa_prompt.png` i deixa el connector en estat `Pendent de 2FA`.
+   - **Protecció amb Circuit Breaker**: Si es produeixen 3 intents fallits consecutius (per problemes de xarxa o canvi de portal), el connector activa automàticament una pausa preventiva de 60 minuts per evitar qualsevol bloqueig de compte a la companyia.
+   - **Recuperació històrica per lots (Bulk)**: L'usuari pot accedir puntualment (ex: cada 3 o 6 mesos), validar la sessió amb el codi 2FA si ha caducat, i amb el botó "Històric" descarregar de cop totes les factures pendents acumulades.
 
 ---
 
