@@ -129,7 +129,10 @@ kubectl logs -f job/subministres-etl-manual-01 -n subministres
 
 L'aplicació incorpora una interfície web ultralleugera (FastAPI + HTMX + Tailwind CSS) per a la gestió interactiva:
 
-- **Sincronització sota demanda**: Botó "Sincronitzar Tot" o sincronització independent per proveïdor (Veolia, Catgas, Bonpreu, Digi) sense obrir terminals ni esperar el cron.
+- **Sincronització sota demanda**: Botó "Sincronitzar Tot" o accions individuals per proveïdor (Veolia, Catgas, Bonpreu, Digi).
+- **⚡ Descàrrega ràpida de l'Última Factura (KISS)**: Botó "Última" a cada proveïdor per baixar únicament la darrera factura si no és al NAS, evitant duplicats tant a la base de dades com a l'emmagatzematge.
+- **📚 Explorador Històric & Descàrrega per Lots (Bulk Sync)**: Botó "Històric" que consulta totes les factures disponibles a la companyia (per bústia IMAP o portal web), les compara amb el NAS mostrant badges (`✅ Al NAS` vs `⏳ Pendent`) i ofereix el botó directe **"Descarregar Només Pendents"**.
+- **🔍 Control d'Accessibilitat i Mida de Lletra (A- / A+)**: Selector de mida de font amb persistència a `localStorage` (100% fins a 150%) dissenyat per a una lectura òptima en monitors grans de 32", 4K o dispositius mòbils.
 - **Pujada manual de factures (Dropzone / Drag & Drop)**: Permet arrossegar un PDF descarregat manualment; el sistema en detecta el proveïdor, n'extreu automàticament les dades, el guarda al NAS Samba i injecta les mètriques a InfluxDB.
 - **Explorador de Factures al NAS**: Taula interactiva amb cercador, botó de descàrrega directa i **visor de PDF integrat en finestra modal** sense haver de muntar la unitat SMB al dispositiu.
 - **Consola de Logs en directe**: Terminal integrada amb actualització automàtica cada 3 segons (polling HTMX) per seguir el progrés de l'scraping o detectar avisos de sessió.
@@ -139,7 +142,9 @@ L'aplicació incorpora una interfície web ultralleugera (FastAPI + HTMX + Tailw
 | Mètode | Endpoint | Descripció |
 | :--- | :--- | :--- |
 | `GET` | `/` | Pàgina principal del panell de control |
-| `POST` | `/api/sync` | Dispara sincronització en background (`connector` opcional) |
+| `POST` | `/api/sync` | Dispara sincronització estàndard (`connector` opcional) |
+| `POST` | `/api/sync/latest` | Cerca i descarrega exclusivament l'última factura |
+| `GET` | `/api/history/{conn}` | Retorna el modal amb l'històric i comparativa amb el NAS |
 | `GET` | `/api/logs` | Fragment HTML amb els darrers logs per a polling HTMX |
 | `POST` | `/api/upload` | Pujada multipart d'un fitxer PDF i processament immediat |
 | `GET` | `/api/pdf/view/{path}` | Serveix el fitxer PDF amb capçalera `inline` per al visor |

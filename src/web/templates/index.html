@@ -26,6 +26,14 @@
         }
       }
     }
+  <!-- Script per carregar la mida de font abans del render (evita parpelleig) -->
+  <script>
+    (function() {
+      const saved = localStorage.getItem('subministres_font_size');
+      if (saved) {
+        document.documentElement.style.fontSize = saved + 'px';
+      }
+    })();
   </script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased">
@@ -46,8 +54,15 @@
         </div>
       </div>
 
-      <!-- Indicadors ràpids d'estat -->
-      <div class="flex items-center gap-4 text-xs">
+      <!-- Indicadors ràpids d'estat i Controls -->
+      <div class="flex items-center gap-3 text-xs">
+        <!-- Control d'Accessibilitat / Mida de Lletra (ideal per a monitors de 32" o 4K) -->
+        <div class="flex items-center bg-slate-900 border border-slate-800 rounded-lg p-0.5 text-slate-300 shadow-sm" title="Ajusta la mida del text">
+          <button type="button" onclick="changeFontSize(-1)" title="Lletra més petita" class="px-2 py-1 rounded hover:bg-slate-800 hover:text-white font-bold transition">A-</button>
+          <span id="font-size-label" class="text-[11px] px-1.5 text-slate-400 font-mono">100%</span>
+          <button type="button" onclick="changeFontSize(1)" title="Lletra més gran" class="px-2 py-1 rounded hover:bg-slate-800 hover:text-white font-bold transition">A+</button>
+        </div>
+
         <div class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800">
           <span class="w-2 h-2 rounded-full {% if settings.INFLUXDB_ENABLED %}bg-emerald-400 animate-pulse{% else %}bg-slate-500{% endif %}"></span>
           <span class="text-slate-300">InfluxDB</span>
@@ -118,14 +133,27 @@
             </div>
           </div>
 
-          <div class="pt-4 border-t border-slate-800/80 mt-2">
+          <div class="pt-4 border-t border-slate-800/80 mt-2 grid grid-cols-2 gap-2">
+            <!-- Botó 1: Última factura ràpida (KISS) -->
             <button 
-              hx-post="/api/sync" 
+              hx-post="/api/sync/latest" 
               hx-vals='{"connector": "{{ card.id }}"}'
               hx-target="#notification-area"
-              class="w-full flex items-center justify-center gap-1.5 py-2 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-xl border border-slate-700 transition">
-              <i data-lucide="play" class="w-3.5 h-3.5 text-emerald-400"></i>
-              <span>Sincronitzar {{ card.name }}</span>
+              title="Cerca només la darrera factura disponible (no la descarrega si ja és al NAS)"
+              class="flex items-center justify-center gap-1.5 py-2 px-2.5 bg-emerald-950/60 hover:bg-emerald-900/80 text-emerald-300 text-xs font-semibold rounded-xl border border-emerald-800/60 transition shadow-sm">
+              <i data-lucide="zap" class="w-3.5 h-3.5 text-emerald-400"></i>
+              <span>Última</span>
+            </button>
+
+            <!-- Botó 2: Explorador Històric & Bulk -->
+            <button 
+              hx-get="/api/history/{{ card.id }}"
+              hx-target="#history-modal-content"
+              onclick="openHistoryModal()"
+              title="Explora tot l'històric disponible i tria quines descarregar"
+              class="flex items-center justify-center gap-1.5 py-2 px-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-xl border border-slate-700 transition">
+              <i data-lucide="history" class="w-3.5 h-3.5 text-blue-400"></i>
+              <span>Històric</span>
             </button>
           </div>
         </div>
@@ -291,10 +319,60 @@
     </div>
   </div>
 
+  <!-- Modal per a Sincronització Històrica & Bulk -->
+  <div id="history-modal" class="fixed inset-0 z-50 hidden bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl max-h-[85vh] flex flex-col shadow-2xl overflow-hidden">
+      <div id="history-modal-content">
+        <div class="p-8 text-center text-slate-400 flex flex-col items-center justify-center gap-3">
+          <i data-lucide="loader-2" class="w-8 h-8 text-emerald-400 animate-spin"></i>
+          <span>Consultant factures disponibles a la companyia...</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script>
     // Inicialitzar icones Lucide
     lucide.createIcons();
 
+    // -------------------------------------------------------------
+    // Control de Mida de Font / Zoom (ideal per a monitors 32" o 4K)
+    // -------------------------------------------------------------
+    const fontSizes = [14, 16, 18, 20, 22, 24];
+    let currentFontIndex = 1; // 16px per defecte
+
+    function initFontSize() {
+      const saved = localStorage.getItem('subministres_font_size');
+      if (saved) {
+        const parsed = parseInt(saved, 10);
+        const idx = fontSizes.indexOf(parsed);
+        if (idx !== -1) currentFontIndex = idx;
+      }
+      applyFontSize();
+    }
+
+    function changeFontSize(delta) {
+      currentFontIndex = Math.max(0, Math.min(fontSizes.length - 1, currentFontIndex + delta));
+      localStorage.setItem('subministres_font_size', fontSizes[currentFontIndex]);
+      applyFontSize();
+    }
+
+    function applyFontSize() {
+      const size = fontSizes[currentFontIndex];
+      document.documentElement.style.fontSize = size + 'px';
+      const label = document.querySelector('#font-size-label');
+      if (label) {
+        const pct = Math.round((size / 16) * 100);
+        label.textContent = pct + '%';
+      }
+    }
+
+    // Inicialitzar mida de font
+    initFontSize();
+
+    // -------------------------------------------------------------
+    // Modals
+    // -------------------------------------------------------------
     function openPdfModal(url, title) {
       const modalTitle = document.querySelector('#pdf-modal-title');
       const frame = document.querySelector('#pdf-frame');
@@ -313,6 +391,44 @@
         modal.classList.add('hidden');
         frame.setAttribute('src', '');
       }
+    }
+
+    function openHistoryModal() {
+      const modal = document.querySelector('#history-modal');
+      const content = document.querySelector('#history-modal-content');
+      if (modal && content) {
+        content.innerHTML = `
+          <div class="p-8 text-center text-slate-400 flex flex-col items-center justify-center gap-3">
+            <div class="w-8 h-8 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin"></div>
+            <span>Consultant factures disponibles a la companyia...</span>
+          </div>`;
+        modal.classList.remove('hidden');
+      }
+    }
+
+    function closeHistoryModal() {
+      const modal = document.querySelector('#history-modal');
+      if (modal) {
+        modal.classList.add('hidden');
+      }
+    }
+
+    function toggleAllCheckboxes(checked) {
+      document.querySelectorAll('.bulk-cb').forEach(cb => {
+        cb.checked = checked;
+      });
+    }
+
+    function selectOnlyPending() {
+      document.querySelectorAll('.bulk-cb').forEach(cb => {
+        // Seleccionar només les que tenen el badge groc de pendent
+        const row = cb.closest('tr');
+        if (row && row.textContent.includes('Pendent')) {
+          cb.checked = true;
+        } else {
+          cb.checked = false;
+        }
+      });
     }
 
     function filterInvoices() {

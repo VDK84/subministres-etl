@@ -1,13 +1,13 @@
 # pyright: reportMissingImports=false
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
 import email
-from email.header import decode_header
 import email.message
-from email.utils import parsedate_to_datetime
 import imaplib
 import logging
 import re
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from email.header import decode_header
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from src.config import settings

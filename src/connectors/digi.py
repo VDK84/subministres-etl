@@ -40,15 +40,25 @@ class DigiConnector(BaseConnector):
     def is_enabled(self) -> bool:
         return settings.DIGI_ENABLED
 
-    def run(self, imap_client: ImapMailboxClient) -> list[FacturaResult]:
+    def run(
+        self,
+        imap_client: ImapMailboxClient,
+        mode: str = "normal",
+        limit: int | None = None,
+    ) -> list[FacturaResult]:
         results: list[FacturaResult] = []
         if not self.is_enabled():
             return results
 
-        self.logger.info("Executant connector Digi Mobil (Telefonia / Fibra)...")
+        fetch_limit = 1 if mode == "latest" else (limit or (None if mode == "all" else 3))
+        self.logger.info(f"Executant connector Digi Mobil (mode={mode}, limit={fetch_limit})...")
 
         # 1. Comprovar correus d'avís de Digi
-        emails = imap_client.fetch_recent_emails(sender_filters=list(self.EMAIL_SENDERS))
+        days_back = 730 if mode == "all" else settings.DAYS_BACK
+        emails = imap_client.fetch_recent_emails(
+            sender_filters=list(self.EMAIL_SENDERS),
+            days_back=days_back,
+        )
         self.logger.info(f"Trobats {len(emails)} correus d'avís de Digi Mobil")
 
         trobat_avis = False
@@ -71,6 +81,8 @@ class DigiConnector(BaseConnector):
                     if metriques:
                         res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
                         results.append(res)
+                        if mode == "latest":
+                            return results
 
         if results:
             return results
@@ -95,16 +107,18 @@ class DigiConnector(BaseConnector):
             return results
 
         self.logger.info("Iniciant descàrrega de factures des del portal Mi Digi...")
-        pdf_list = self.fetch_invoices_from_portal()
+        pdf_list = self.fetch_invoices_from_portal(limit=fetch_limit)
         for pdf_bytes, filename in pdf_list:
             metriques = self.extract_metrics_from_pdf(pdf_bytes)
             if metriques:
                 res = self.save_and_ingest(pdf_bytes, metriques, origen="web_portal_scraping")
                 results.append(res)
+                if mode == "latest":
+                    return results
 
         return results
 
-    def fetch_invoices_from_portal(self) -> list[tuple[bytes, str]]:
+    def fetch_invoices_from_portal(self, limit: int | None = 3) -> list[tuple[bytes, str]]:
         """Autenticació al portal Mi Digi amb Playwright per descarregar les últimes factures."""
         downloaded: list[tuple[bytes, str]] = []
         try:

@@ -1,14 +1,14 @@
 # pyright: reportMissingImports=false
+import logging
 from collections import deque
 from datetime import date, datetime
-import logging
 from pathlib import Path
 from typing import Annotated, Any
 
+import uvicorn
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
-import uvicorn
 
 from src.config import settings
 from src.connectors import (
@@ -97,10 +97,14 @@ def list_nas_invoices() -> list[dict[str, Any]]:
     return invoices
 
 
-def run_sync_task(connector_name: str | None = None) -> None:
+def run_sync_task(
+    connector_name: str | None = None,
+    mode: str = "normal",
+    limit: int | None = None,
+) -> None:
     """Tasca d'execució d'ETL llançada en segon pla."""
     execution_state["is_running"] = True
-    execution_state["active_connector"] = connector_name or "Tots"
+    execution_state["active_connector"] = f"{connector_name or 'Tots'} ({mode})"
     execution_state["last_status"] = "Sincronitzant..."
     logger.info(f"Iniciant sincronització sota demanda: {execution_state['active_connector']}")
 
@@ -114,9 +118,9 @@ def run_sync_task(connector_name: str | None = None) -> None:
     has_errors = False
 
     for conn in to_run:
-        logger.info(f"Executant connector: {conn.name.upper()} ({conn.tipus.value})")
+        logger.info(f"Executant connector: {conn.name.upper()} (mode={mode})")
         try:
-            res = conn.run(imap_client)
+            res = conn.run(imap_client, mode=mode, limit=limit)
             results.extend(res)
             for r in res:
                 if r.errors:
@@ -247,6 +251,122 @@ async def get_logs_fragment():
         )
 
     return HTMLResponse(is_running_badge + "".join(html_lines))
+
+
+@app.post("/api/sync/latest")
+async def trigger_sync_latest(
+    background_tasks: BackgroundTasks,
+    connector: str = Form(default=""),
+):
+    """Cerca exclusivament la darrera factura disponible per a un proveïdor."""
+    if execution_state["is_running"]:
+        return HTMLResponse(
+            '<div class="p-4 mb-4 text-sm text-yellow-800 rounded-lg bg-yellow-50 dark:bg-gray-800 dark:text-yellow-300">'
+            "Ja hi ha una sincronització en curs. Si us plau, espera que finalitzi.</div>"
+        )
+
+    target = connector.strip() if connector else None
+    background_tasks.add_task(run_sync_task, target, mode="latest", limit=1)
+
+    desc = f"de l'última factura de {target.upper()}" if target else "de les últimes factures de tots els proveïdors"
+    return HTMLResponse(
+        f'<div class="p-4 mb-4 text-sm text-emerald-800 rounded-lg bg-emerald-50 dark:bg-gray-800 dark:text-emerald-400">'
+        f"⚡ Cerca ràpida iniciada {desc}. Si ja és al NAS, no es duplicarà.</div>"
+    )
+
+
+@app.get("/api/history/{connector}")
+async def get_connector_history(connector: str):
+    """Consulta les factures històriques disponibles i en retorna el fragment per al modal."""
+    connectors = get_all_connectors_map()
+    conn = connectors.get(connector.lower())
+    if not conn:
+        raise HTTPException(status_code=404, detail=f"Proveïdor '{connector}' desconegut.")
+
+    invoices = conn.fetch_available_invoices(imap_client)
+    pendents = [inv for inv in invoices if not inv.get("exists_in_nas", False)]
+
+    # Renderitzem el fragment HTML per al modal
+    html_items = []
+    for inv in invoices:
+        exists = inv.get("exists_in_nas", False)
+        badge = (
+            '<span class="px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">✅ Al NAS</span>'
+            if exists
+            else '<span class="px-2 py-0.5 rounded text-[11px] font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">⏳ Pendent</span>'
+        )
+        checked = "" if exists else "checked"
+
+        html_items.append(
+            f'<tr class="border-b border-slate-800/60 hover:bg-slate-800/30">'
+            f'<td class="py-2.5 px-3">'
+            f'<input type="checkbox" name="selected_invoices" value="{inv.get("id")}" {checked} class="bulk-cb rounded bg-slate-900 border-slate-700 text-emerald-600 focus:ring-emerald-500">'
+            f"</td>"
+            f'<td class="py-2.5 px-3 font-mono text-xs text-white">{inv.get("data", "-")}</td>'
+            f'<td class="py-2.5 px-3 text-xs text-slate-300 font-mono truncate max-w-[200px]" title="{inv.get("numero", "")}">{inv.get("numero", "-")}</td>'
+            f'<td class="py-2.5 px-3 text-xs font-semibold text-emerald-400 text-right">{inv.get("import", 0.0):.2f} €</td>'
+            f'<td class="py-2.5 px-3 text-center">{badge}</td>'
+            f"</tr>"
+        )
+
+    rows_html = (
+        "".join(html_items)
+        if html_items
+        else (
+            '<tr><td colspan="5" class="py-8 text-center text-slate-500 text-xs">No s\'ha trobat cap factura disponible o no s\'han pogut consultar metadades.</td></tr>'
+        )
+    )
+
+    modal_html = f"""
+    <div class="p-6 space-y-5">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-4">
+        <div>
+          <h3 class="text-base font-bold text-white flex items-center gap-2">
+            <span>📚 Històric de Factures — {conn.name.upper()}</span>
+          </h3>
+          <p class="text-xs text-slate-400">Total trobades: {len(invoices)} | Pendents de descarregar: <strong class="text-amber-400">{len(pendents)}</strong></p>
+        </div>
+        <button onclick="closeHistoryModal()" class="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800">
+          ✕
+        </button>
+      </div>
+
+      <!-- Accions ràpides KISS -->
+      <div class="flex flex-wrap items-center justify-between gap-3 bg-slate-950/60 p-3 rounded-xl border border-slate-800">
+        <div class="flex items-center gap-2 text-xs">
+          <button type="button" onclick="toggleAllCheckboxes(true)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700">Seleccionar Tot</button>
+          <button type="button" onclick="toggleAllCheckboxes(false)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700">Deseleccionar</button>
+          <button type="button" onclick="selectOnlyPending()" class="px-2.5 py-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 rounded-lg border border-amber-500/30">Només Pendents</button>
+        </div>
+
+        <form hx-post="/api/sync" hx-target="#notification-area" onclick="closeHistoryModal()" class="flex items-center gap-2">
+          <input type="hidden" name="connector" value="{conn.name}">
+          <button type="submit" class="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-lg shadow transition flex items-center gap-1.5">
+            <span>📥 Sincronitzar Tot l'Històric</span>
+          </button>
+        </form>
+      </div>
+
+      <!-- Taula de factures -->
+      <div class="max-h-72 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/40">
+        <table class="w-full text-left border-collapse">
+          <thead class="sticky top-0 bg-slate-900 border-b border-slate-800 text-[11px] text-slate-400 uppercase tracking-wider">
+            <tr>
+              <th class="py-2.5 px-3 w-8"></th>
+              <th class="py-2.5 px-3">Data</th>
+              <th class="py-2.5 px-3">Factura</th>
+              <th class="py-2.5 px-3 text-right">Import</th>
+              <th class="py-2.5 px-3 text-center">Estat al NAS</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows_html}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    """
+    return HTMLResponse(modal_html)
 
 
 @app.post("/api/upload")

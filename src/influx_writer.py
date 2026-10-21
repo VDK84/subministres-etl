@@ -1,12 +1,12 @@
 # pyright: reportMissingImports=false
-from datetime import UTC, datetime, time
 import logging
+from datetime import UTC, datetime, time
 
+import urllib3.exceptions
 from influxdb_client.client.exceptions import InfluxDBError
 from influxdb_client.client.influxdb_client import InfluxDBClient
 from influxdb_client.client.write.point import Point
 from influxdb_client.client.write_api import SYNCHRONOUS
-import urllib3.exceptions
 
 from src.config import settings
 from src.models import FacturaMetriques

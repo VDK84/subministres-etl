@@ -1,6 +1,7 @@
 # pyright: reportMissingImports=false
-from abc import ABC, abstractmethod
 import logging
+from abc import ABC, abstractmethod
+from typing import Any
 
 from src.config import settings
 from src.email_client import ImapMailboxClient
@@ -25,8 +26,23 @@ class BaseConnector(ABC):
         """Determina si el connector està habilitat per configuració."""
 
     @abstractmethod
-    def run(self, imap_client: ImapMailboxClient) -> list[FacturaResult]:
-        """Executa l'ETL per a aquest connector: descàrrega, parseig, emmagatzematge i ingesta."""
+    def run(
+        self,
+        imap_client: ImapMailboxClient,
+        mode: str = "normal",
+        limit: int | None = None,
+    ) -> list[FacturaResult]:
+        """Executa l'ETL per a aquest connector: descàrrega, parseig, emmagatzematge i ingesta.
+
+        Modes admesos:
+          - "normal": processament segons configuració (days_back per defecte)
+          - "latest": cerca exclusivament l'última factura disponible
+          - "all": cerca tot l'històric disponible
+        """
+
+    def fetch_available_invoices(self, imap_client: ImapMailboxClient) -> list[dict[str, Any]]:
+        """Llista les factures disponibles al proveïdor indicant si ja estan al NAS."""
+        return []
 
     def save_and_ingest(
         self,

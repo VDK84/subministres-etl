@@ -1,7 +1,7 @@
 # pyright: reportMissingImports=false
-from datetime import date
 import logging
 import re
+from datetime import date
 
 from src.config import settings
 from src.connectors.base import BaseConnector
@@ -41,15 +41,25 @@ class BonpreuConnector(BaseConnector):
     def is_enabled(self) -> bool:
         return settings.BONPREU_ENABLED
 
-    def run(self, imap_client: ImapMailboxClient) -> list[FacturaResult]:
+    def run(
+        self,
+        imap_client: ImapMailboxClient,
+        mode: str = "normal",
+        limit: int | None = None,
+    ) -> list[FacturaResult]:
         results: list[FacturaResult] = []
         if not self.is_enabled():
             return results
 
-        self.logger.info("Executant connector Bonpreu Esclat Energia (Electricitat)...")
+        fetch_limit = 1 if mode == "latest" else (limit or (None if mode == "all" else 3))
+        self.logger.info(f"Executant connector Bonpreu Esclat Energia (mode={mode}, limit={fetch_limit})...")
 
         # 1. Analitzar correus d'avís de factura
-        emails = imap_client.fetch_recent_emails(sender_filters=list(self.EMAIL_SENDERS))
+        days_back = 730 if mode == "all" else settings.DAYS_BACK
+        emails = imap_client.fetch_recent_emails(
+            sender_filters=list(self.EMAIL_SENDERS),
+            days_back=days_back,
+        )
         self.logger.info(f"Trobats {len(emails)} correus d'avís de Bonpreu Energia")
 
         trobat_avis = False
@@ -58,7 +68,6 @@ class BonpreuConnector(BaseConnector):
 
         for em in emails:
             trobat_avis = True
-            # Intentem extreure l'import anunciat al correu (ex: "import de 64,23 €")
             parsed_amt = parse_euro_amount(em.body_text) or parse_euro_amount(em.subject)
             if parsed_amt is not None and import_avis is None:
                 import_avis = parsed_amt
@@ -73,6 +82,8 @@ class BonpreuConnector(BaseConnector):
                     if metriques:
                         res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
                         results.append(res)
+                        if mode == "latest":
+                            return results
 
         if results:
             return results
@@ -84,7 +95,6 @@ class BonpreuConnector(BaseConnector):
                 "No es pot fer scraping del portal per obtenir el PDF."
             )
             if trobat_avis and import_avis is not None:
-                # Creem mètrica mínima d'avís si tenim l'import del correu
                 data_final = data_avis or date.today()
                 metriques_avis = FacturaMetriques(
                     proveidor=self.name,
@@ -98,16 +108,18 @@ class BonpreuConnector(BaseConnector):
             return results
 
         self.logger.info("Iniciant descàrrega de factures des del portal de Bonpreu Energia...")
-        pdf_list = self.fetch_invoices_from_portal()
+        pdf_list = self.fetch_invoices_from_portal(limit=fetch_limit)
         for pdf_bytes, filename in pdf_list:
             metriques = self.extract_metrics_from_pdf(pdf_bytes)
             if metriques:
                 res = self.save_and_ingest(pdf_bytes, metriques, origen="web_portal_scraping")
                 results.append(res)
+                if mode == "latest":
+                    return results
 
         return results
 
-    def fetch_invoices_from_portal(self) -> list[tuple[bytes, str]]:
+    def fetch_invoices_from_portal(self, limit: int | None = 3) -> list[tuple[bytes, str]]:
         """Autenticació al portal de Bonpreu via Playwright headless per descarregar factures PDF."""
         downloaded: list[tuple[bytes, str]] = []
         try:

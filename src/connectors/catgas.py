@@ -32,15 +32,27 @@ class CatgasConnector(BaseConnector):
     def is_enabled(self) -> bool:
         return settings.CATGAS_ENABLED
 
-    def run(self, imap_client: ImapMailboxClient) -> list[FacturaResult]:
+    def run(
+        self,
+        imap_client: ImapMailboxClient,
+        mode: str = "normal",
+        limit: int | None = None,
+    ) -> list[FacturaResult]:
         results: list[FacturaResult] = []
         if not self.is_enabled():
             return results
 
-        self.logger.info("Executant connector Catgas (Gas natural)...")
+        days_back = 730 if mode == "all" else settings.DAYS_BACK
+        self.logger.info(f"Executant connector Catgas (Gas natural, mode={mode})...")
 
-        emails = imap_client.fetch_recent_emails(sender_filters=list(self.EMAIL_SENDERS))
+        emails = imap_client.fetch_recent_emails(
+            sender_filters=list(self.EMAIL_SENDERS),
+            days_back=days_back,
+        )
         self.logger.info(f"Trobats {len(emails)} correus potencials de Catgas")
+
+        # Ordenar els correus del més recent al més antic
+        emails.sort(key=lambda x: x.date or date.min, reverse=True)
 
         for em in emails:
             for att in em.attachments:
@@ -56,7 +68,53 @@ class CatgasConnector(BaseConnector):
                     res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
                     results.append(res)
 
+                    if mode == "latest":
+                        return results
+                    if limit and len(results) >= limit:
+                        return results
+
         return results
+
+    def fetch_available_invoices(self, imap_client: ImapMailboxClient) -> list[dict]:
+        """Llista les factures de Catgas trobades a la bústia i el seu estat al NAS."""
+        invoices: list[dict] = []
+        if not self.is_enabled():
+            return invoices
+
+        emails = imap_client.fetch_recent_emails(sender_filters=list(self.EMAIL_SENDERS), days_back=730)
+        emails.sort(key=lambda x: x.date or date.min, reverse=True)
+
+        from src.storage import storage
+
+        for em in emails:
+            for att in em.attachments:
+                if not att.filename.lower().endswith(".pdf"):
+                    continue
+                d_str = em.date.strftime("%Y-%m-%d") if em.date else "Data desconeguda"
+                any_str = str(em.date.year) if em.date else str(date.today().year)
+                mes_str = f"{em.date.month:02d}" if em.date else "01"
+
+                # Intentem parsejar ràpidament o deduïm nom
+                parsed_amt = parse_euro_amount(em.subject) or parse_euro_amount(em.body_text) or 0.0
+                clean_name = re.sub(r"[^A-Za-z0-9_-]", "_", att.filename)
+                expected_filename = f"{any_str}_{mes_str}_{self.name}_{clean_name}"
+                if not expected_filename.endswith(".pdf"):
+                    expected_filename += ".pdf"
+
+                ja_al_nas = storage.exists(self.tipus.value, self.name, any_str, expected_filename)
+                invoices.append(
+                    {
+                        "id": f"{em.msg_id}_{att.filename}",
+                        "proveidor": self.name,
+                        "tipus": self.tipus.value,
+                        "data": d_str,
+                        "numero": att.filename.replace(".pdf", ""),
+                        "import": parsed_amt,
+                        "subject": em.subject,
+                        "exists_in_nas": ja_al_nas,
+                    }
+                )
+        return invoices
 
     def extract_metrics_from_pdf(self, pdf_bytes: bytes) -> FacturaMetriques | None:
         """Parseja el PDF de Catgas per obtenir dades de consum en kWh/m3 i import."""
