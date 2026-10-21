@@ -26,3 +26,4 @@ Thumbs.db
 # Output local testing
 factures_local/
 logs/
+tmp/**
