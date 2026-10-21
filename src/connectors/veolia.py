@@ -2,6 +2,20 @@
 import logging
 import re
 from datetime import date
+from pathlib import Path
+from typing import Any
+
+try:
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+
+    HAVE_PLAYWRIGHT = True
+except ImportError:
+    HAVE_PLAYWRIGHT = False
+    PlaywrightError = Exception  # type: ignore
+    PlaywrightTimeoutError = Exception  # type: ignore
+    sync_playwright = None  # type: ignore
 
 from src.config import settings
 from src.connectors.base import BaseConnector
@@ -28,6 +42,8 @@ class VeoliaConnector(BaseConnector):
     tipus = SubministreType.AIGUA
 
     EMAIL_SENDERS: tuple[str, ...] = ("veolia", "aiguesdebarcelona", "agbar", "suac@veolia.com")
+    PORTAL_LOGIN_URL = "https://agbar.veolia.cat/login"
+    PORTAL_INVOICES_URL = "https://agbar.veolia.cat/ca/group/sgab/mis-facturas"
 
     def is_enabled(self) -> bool:
         return settings.VEOLIA_ENABLED
@@ -75,7 +91,120 @@ class VeoliaConnector(BaseConnector):
                     if limit and len(results) >= limit:
                         return results
 
+        if results:
+            return results
+
+        # 2. Descàrrega directa des del portal d'Agbar-Veolia si no hi ha PDF per correu
+        if settings.VEOLIA_USER and settings.VEOLIA_PASSWORD:
+            fetch_limit = 1 if mode == "latest" else (limit or (None if mode == "all" else 3))
+            self.logger.info(f"Iniciant descàrrega des del portal web d'Agbar-Veolia (límit: {fetch_limit})...")
+            pdf_list = self.fetch_invoices_from_portal(limit=fetch_limit)
+            for pdf_bytes, filename in pdf_list:
+                metriques = self.extract_metrics_from_pdf(pdf_bytes)
+                if not metriques:
+                    metriques = self._fallback_metrics(pdf_bytes, date.today())
+                if metriques:
+                    res = self.save_and_ingest(pdf_bytes, metriques, origen="web_portal_scraping")
+                    results.append(res)
+                    if mode == "latest":
+                        return results
+
         return results
+
+    def fetch_invoices_from_portal(self, limit: int | None = 3) -> list[tuple[bytes, str]]:
+        """Autenticació al portal de clients d'Agbar/Veolia via Playwright i descàrrega de factures."""
+        downloaded: list[tuple[bytes, str]] = []
+        if self.is_in_cooldown():
+            return downloaded
+
+        if not HAVE_PLAYWRIGHT or sync_playwright is None:
+            self.logger.warning("Playwright no està instal·lat en aquest entorn.")
+            return downloaded
+
+        session_dir = Path(settings.NAS_MOUNT_PATH) / ".sessions"
+        session_file = session_dir / "veolia_session.json"
+        try:
+            session_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=settings.HEADLESS_BROWSER)
+                try:
+                    context_kwargs: dict[str, Any] = {"accept_downloads": True}
+                    if session_file.exists():
+                        self.logger.info("Carregant sessió prèvia d'Agbar-Veolia des del NAS...")
+                        context_kwargs["storage_state"] = str(session_file)
+
+                    context = browser.new_context(**context_kwargs)
+                    page = context.new_page()
+
+                    # 1. Intentem anar directament a l'apartat de factures
+                    self.logger.info(f"Obrint factures d'Agbar-Veolia: {self.PORTAL_INVOICES_URL}")
+                    page.goto(self.PORTAL_INVOICES_URL, timeout=settings.SCRAPER_TIMEOUT_MS)
+                    page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+
+                    # 2. Si ens redirigeix al formulari de login, iniciem sessió
+                    if "login" in page.url.lower() or page.query_selector("#loginForm"):
+                        self.logger.info("Sessió no activa a Agbar-Veolia. Iniciant login...")
+                        page.fill("input#login, input[name='_CustomLoginPortlet_login']", settings.VEOLIA_USER or "")
+                        page.fill(
+                            "input#password, input[name='_CustomLoginPortlet_password']", settings.VEOLIA_PASSWORD or ""
+                        )
+                        page.click("button#btn-submit, button[type='submit']")
+                        page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+
+                    # 3. Si hem accedit correctament, desem la sessió al NAS
+                    if "login" not in page.url.lower():
+                        try:
+                            context.storage_state(path=str(session_file))
+                            self.logger.info("✅ Sessió d'Agbar-Veolia desada al NAS!")
+                        except (OSError, RuntimeError):
+                            pass
+
+                    # 4. Navegar a factures si cal
+                    if "mis-facturas" not in page.url.lower():
+                        page.goto(self.PORTAL_INVOICES_URL, timeout=settings.SCRAPER_TIMEOUT_MS)
+                        page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+
+                    # 5. Cerca botons de descàrrega de factura digital (segons DOM real d'Agbar)
+                    download_buttons = page.query_selector_all(
+                        "#descargar-factura-digital a, a:has-text('Descarrega factura digital'), a[href*='descargarFacturaPdf']"
+                    )
+                    max_dl = limit or 3
+                    self.logger.info(
+                        f"Trobats {len(download_buttons)} enllaços de descàrrega a Agbar-Veolia (límit: {max_dl})"
+                    )
+
+                    for i, btn in enumerate(download_buttons[:max_dl]):
+                        try:
+                            with page.expect_download(timeout=15000) as download_info:
+                                btn.click()
+                            download = download_info.value
+                            path = download.path()
+                            if path:
+                                with open(path, "rb") as f:
+                                    downloaded.append(
+                                        (f.read(), download.suggested_filename or f"veolia_factura_{i}.pdf")
+                                    )
+                        except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError) as err:
+                            self.logger.warning(f"No s'ha pogut descarregar la factura {i}: {err}")
+
+                except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as page_err:
+                    self.record_failure(f"Error de navegació a Agbar-Veolia: {page_err}")
+                    self.logger.error(f"Error navegant al portal Agbar-Veolia: {page_err}")
+                finally:
+                    browser.close()
+
+        except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as e:
+            self.record_failure(f"Error de Playwright a Agbar-Veolia: {e}")
+            self.logger.error(f"Error durant el web scraping d'Agbar-Veolia: {e}")
+
+        if downloaded:
+            self.record_success()
+
+        return downloaded
 
     def fetch_available_invoices(self, imap_client: ImapMailboxClient) -> list[dict]:
         """Llista les factures de Veolia trobades a la bústia i el seu estat al NAS."""
