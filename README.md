@@ -1,5 +1,9 @@
 # subministres-etl 💧⚡🔥📱
 
+[![Build, Scan & Publish Docker Image](https://github.com/VDK84/subministres-etl/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/VDK84/subministres-etl/actions/workflows/docker-publish.yml)
+[![CodeQL Analysis](https://github.com/VDK84/subministres-etl/actions/workflows/codeql.yml/badge.svg)](https://github.com/VDK84/subministres-etl/actions/workflows/codeql.yml)
+[![SonarCloud Analysis](https://github.com/VDK84/subministres-etl/actions/workflows/sonarcloud.yml/badge.svg)](https://github.com/VDK84/subministres-etl/actions/workflows/sonarcloud.yml)
+
 ETL autònom i modular per a la recol·lecció, processament, emmagatzematge al NAS Samba i ingesta a **InfluxDB v2** de factures de subministraments de la llar (**Aigua, Gas, Llum i Telefonia**).
 
 Dissenyat per executar-se com a contenidor i **CronJob** a Kubernetes (**K3s**) gestionat via GitOps amb **ArgoCD**, protegint els secrets mitjançant **OpenBao** i **External Secrets Operator (ESO)**.
@@ -164,8 +168,17 @@ python -m src.main --connector bonpreu --dry-run
 
 ---
 
-## 🐳 Construcció del Contenidor
+## 🐳 Construcció i Pipeline DevSecOps
+
+El projecte disposa d'un pipeline complet i automatitzat de **DevSecOps** mitjançant **GitHub Actions**:
+
+1. **Docker Build & Push**: Construcció multi-etapa amb Buildx i publicació directa a GitHub Container Registry (`ghcr.io/vdk84/subministres-etl:latest`).
+2. **Trivy Container Scanner**: Escaneig de vulnerabilitats (CVEs) a les capes de la imatge i publicació d'informes SARIF a la pestanya Security de GitHub.
+3. **GitHub CodeQL (SAST)**: Anàlisi de seguretat de codi per a Python executat en cada commit i setmanalment.
+4. **SonarCloud**: Anàlisi continu de qualitat, mantenibilitat i *code smells*.
+5. **Dependabot**: Alertes i Pull Requests automàtics per a actualitzacions de dependències de Python i Actions.
 
 ```bash
+# Construcció local manual (opcional)
 docker build -t ghcr.io/vdk84/subministres-etl:latest .
 ```
