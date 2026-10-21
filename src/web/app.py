@@ -40,6 +40,15 @@ web_handler = WebLogHandler()
 web_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] (%(name)s) %(message)s", "%H:%M:%S"))
 logging.getLogger().addHandler(web_handler)
 
+
+# Silenciar el polling continu de /api/logs dels access logs d'Uvicorn
+class EndpointFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage().find("/api/logs") == -1
+
+
+logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
+
 app = FastAPI(title="Subministres ETL", version=settings.APP_VERSION)
 
 BASE_DIR = Path(__file__).resolve().parent

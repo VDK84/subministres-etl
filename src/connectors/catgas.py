@@ -52,7 +52,7 @@ class CatgasConnector(BaseConnector):
         self.logger.info(f"Trobats {len(emails)} correus potencials de Catgas")
 
         # Ordenar els correus del més recent al més antic
-        emails.sort(key=lambda x: x.date or date.min, reverse=True)
+        emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
 
         for em in emails:
             for att in em.attachments:
@@ -82,7 +82,7 @@ class CatgasConnector(BaseConnector):
             return invoices
 
         emails = imap_client.fetch_recent_emails(sender_filters=list(self.EMAIL_SENDERS), days_back=730)
-        emails.sort(key=lambda x: x.date or date.min, reverse=True)
+        emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
 
         from src.storage import storage
 
