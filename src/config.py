@@ -47,9 +47,13 @@ class Settings(BaseSettings):
     DIGI_USER: str | None = Field(default=None)
     DIGI_PASSWORD: str | None = Field(default=None)
 
-    # Headless Scraper Settings
+    # Headless Scraper Settings & Protecció de Seguretat (Circuit Breaker)
     HEADLESS_BROWSER: bool = Field(default=True)
     SCRAPER_TIMEOUT_MS: int = Field(default=30000)
+    MAX_SCRAPER_RETRIES: int = Field(default=3, description="Màxim d'intents abans de bloqueig preventiu")
+    SCRAPER_COOLDOWN_MINUTES: int = Field(default=60, description="Minuts de cooldown per evitar bloquejos de compte")
+    BONPREU_PORTAL_URL: str = Field(default="https://www.bonpreuesclat.cat/energia")
+    DIGI_PORTAL_URL: str = Field(default="https://mi.digimobil.es/login")
 
 
 settings = Settings()

@@ -3,6 +3,18 @@ import logging
 import re
 from datetime import date
 
+try:
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+
+    HAVE_PLAYWRIGHT = True
+except ImportError:
+    HAVE_PLAYWRIGHT = False
+    PlaywrightError = Exception  # type: ignore
+    PlaywrightTimeoutError = Exception  # type: ignore
+    sync_playwright = None  # type: ignore
+
 from src.config import settings
 from src.connectors.base import BaseConnector
 from src.email_client import ImapMailboxClient
@@ -49,6 +61,9 @@ class BonpreuConnector(BaseConnector):
     ) -> list[FacturaResult]:
         results: list[FacturaResult] = []
         if not self.is_enabled():
+            return results
+
+        if self.is_in_cooldown():
             return results
 
         fetch_limit = 1 if mode == "latest" else (limit or (None if mode == "all" else 3))
@@ -122,61 +137,80 @@ class BonpreuConnector(BaseConnector):
     def fetch_invoices_from_portal(self, limit: int | None = 3) -> list[tuple[bytes, str]]:
         """Autenticació al portal de Bonpreu via Playwright headless per descarregar factures PDF."""
         downloaded: list[tuple[bytes, str]] = []
-        try:
-            from playwright.sync_api import Error as PlaywrightError
-            from playwright.sync_api import sync_playwright
+        if self.is_in_cooldown():
+            return downloaded
 
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=settings.HEADLESS_BROWSER)
-                context = browser.new_context(accept_downloads=True)
-                page = context.new_page()
-
-                self.logger.info(f"Obrint pàgina d'inici de sessió de Bonpreu: {self.PORTAL_LOGIN_URL}")
-                page.goto(self.PORTAL_LOGIN_URL, timeout=settings.SCRAPER_TIMEOUT_MS)
-
-                # Omplir formulari de credencials
-                # Selectors típics de formulari (email / dni i contrasenya)
-                page.fill(
-                    "input[type='email'], input[name='username'], input[name='login']", settings.BONPREU_USER or ""
-                )
-                page.fill("input[type='password'], input[name='password']", settings.BONPREU_PASSWORD or "")
-                page.click("button[type='submit'], input[type='submit']")
-
-                page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
-
-                # Navegar a l'apartat de factures si cal
-                if "factur" not in page.url.lower():
-                    # Cercar enllaç o pestanya de factures
-                    factura_link = page.query_selector("a[href*='factur'], button:has-text('Factur')")
-                    if factura_link:
-                        factura_link.click()
-                        page.wait_for_load_state("networkidle")
-
-                # Cerca botons de descàrrega de PDF
-                download_buttons = page.query_selector_all(
-                    "a[href*='.pdf'], button:has-text('Descarregar'), a:has-text('PDF')"
-                )
-                self.logger.info(f"Trobats {len(download_buttons)} enllaços de descàrrega de factura")
-
-                for i, btn in enumerate(download_buttons[:3]):  # Limitem a les últimes 3
-                    try:
-                        with page.expect_download(timeout=15000) as download_info:
-                            btn.click()
-                        download = download_info.value
-                        path = download.path()
-                        if path:
-                            with open(path, "rb") as f:
-                                downloaded.append((f.read(), download.suggested_filename or f"bonpreu_{i}.pdf"))
-                    except (PlaywrightError, TimeoutError, OSError) as err:
-                        self.logger.warning(f"No s'ha pogut descarregar el botó {i}: {err}")
-
-                browser.close()
-        except ImportError:
+        if not HAVE_PLAYWRIGHT or sync_playwright is None:
             self.logger.warning(
                 "Playwright no està instal·lat en aquest entorn. Cal instal·lar el paquet per fer scraping."
             )
-        except (TimeoutError, OSError, RuntimeError) as e:
+            return downloaded
+
+        portal_url = settings.BONPREU_PORTAL_URL
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=settings.HEADLESS_BROWSER)
+                try:
+                    context = browser.new_context(accept_downloads=True)
+                    page = context.new_page()
+
+                    self.logger.info(f"Obrint pàgina d'inici de sessió de Bonpreu: {portal_url}")
+                    page.goto(portal_url, timeout=settings.SCRAPER_TIMEOUT_MS)
+
+                    # Omplir formulari de credencials
+                    page.fill(
+                        "input[type='email'], input[name='username'], input[name='login']", settings.BONPREU_USER or ""
+                    )
+                    page.fill("input[type='password'], input[name='password']", settings.BONPREU_PASSWORD or "")
+                    page.click("button[type='submit'], input[type='submit']")
+
+                    page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+
+                    # Navegar a l'apartat de factures si cal
+                    if "factur" not in page.url.lower():
+                        factura_link = page.query_selector("a[href*='factur'], button:has-text('Factur')")
+                        if factura_link:
+                            factura_link.click()
+                            page.wait_for_load_state("networkidle")
+
+                    # Cerca botons de descàrrega de PDF
+                    download_buttons = page.query_selector_all(
+                        "a[href*='.pdf'], button:has-text('Descarregar'), a:has-text('PDF')"
+                    )
+                    max_dl = limit or 3
+                    self.logger.info(
+                        f"Trobats {len(download_buttons)} enllaços de descàrrega de factura (límit: {max_dl})"
+                    )
+
+                    for i, btn in enumerate(download_buttons[:max_dl]):
+                        try:
+                            with page.expect_download(timeout=15000) as download_info:
+                                btn.click()
+                            download = download_info.value
+                            path = download.path()
+                            if path:
+                                with open(path, "rb") as f:
+                                    downloaded.append((f.read(), download.suggested_filename or f"bonpreu_{i}.pdf"))
+                        except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError) as err:
+                            self.logger.warning(f"No s'ha pogut descarregar el botó {i}: {err}")
+
+                except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as page_err:
+                    self.record_failure(f"Error de navegació o resolució: {page_err}")
+                    self.logger.error(f"Error navegant al portal de Bonpreu: {page_err}")
+                finally:
+                    browser.close()
+
+        except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as e:
+            self.record_failure(f"Error de Playwright: {e}")
             self.logger.error(f"Error durant el web scraping de Bonpreu: {e}")
+
+        if downloaded:
+            self.record_success()
+
+        return downloaded
+
+        if downloaded:
+            self.record_success()
 
         return downloaded
 

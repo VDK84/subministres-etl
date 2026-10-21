@@ -1,6 +1,7 @@
 # pyright: reportMissingImports=false
 import logging
 from abc import ABC, abstractmethod
+from datetime import datetime, timedelta
 from typing import Any
 
 from src.config import settings
@@ -20,6 +21,37 @@ class BaseConnector(ABC):
 
     def __init__(self) -> None:
         self.logger = logging.getLogger(f"connector.{self.name}")
+        self.consecutive_failures: int = 0
+        self.cooldown_until: datetime | None = None
+
+    def is_in_cooldown(self) -> bool:
+        """Comprova si el connector està en pausa preventiva de seguretat."""
+        if self.cooldown_until and datetime.now() < self.cooldown_until:
+            minuts_restants = int((self.cooldown_until - datetime.now()).total_seconds() / 60) + 1
+            self.logger.warning(
+                f"⛔ PROTECCIÓ DE SEGURETAT ({self.name.upper()}): S'han assolit {self.consecutive_failures} intents fallits. "
+                f"Operació cancel·lada durant {minuts_restants} minuts per protegir el compte d'un bloqueig."
+            )
+            return True
+        return False
+
+    def record_failure(self, reason: str) -> None:
+        """Registra un error consecutiu i activa el bloqueig preventiu si cal."""
+        self.consecutive_failures += 1
+        self.logger.warning(
+            f"⚠️ Intent fallit ({self.consecutive_failures}/{settings.MAX_SCRAPER_RETRIES}) per a {self.name.upper()}: {reason}"
+        )
+        if self.consecutive_failures >= settings.MAX_SCRAPER_RETRIES:
+            self.cooldown_until = datetime.now() + timedelta(minutes=settings.SCRAPER_COOLDOWN_MINUTES)
+            self.logger.error(
+                f"⛔ CIRCUIT BREAKER ACTIVAT per a {self.name.upper()}: S'han assolit {settings.MAX_SCRAPER_RETRIES} intents fallits. "
+                f"Pausa preventiva de {settings.SCRAPER_COOLDOWN_MINUTES} minuts activada."
+            )
+
+    def record_success(self) -> None:
+        """Reinicia el comptador d'errors en cas d'èxit."""
+        self.consecutive_failures = 0
+        self.cooldown_until = None
 
     @abstractmethod
     def is_enabled(self) -> bool:
