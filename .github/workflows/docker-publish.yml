@@ -9,7 +9,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: vdk84/subministres-etl
 
 permissions:
   contents: read
@@ -54,7 +54,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: DevSecOps Vulnerability Scan with Trivy
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:test-scan
           format: "sarif"
@@ -63,7 +63,7 @@ jobs:
 
       - name: Upload Trivy SARIF report to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        if: always() && hashFiles('trivy-results.sarif') != ''
         with:
           sarif_file: "trivy-results.sarif"
           category: "trivy-container-scan"
