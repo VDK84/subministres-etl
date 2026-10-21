@@ -28,6 +28,10 @@ RUN pip install --no-cache-dir -r requirements.txt \
 COPY src/ ./src
 ENV PYTHONPATH=/app
 
+# Versió SemVer injectada durant el build
+ARG APP_VERSION=0.6.0
+ENV APP_VERSION=${APP_VERSION}
+
 EXPOSE 8000
 
 CMD ["uvicorn", "src.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
