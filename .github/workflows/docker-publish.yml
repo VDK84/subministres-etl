@@ -12,7 +12,7 @@ env:
   IMAGE_NAME: vdk84/subministres-etl
 
 permissions:
-  contents: read
+  contents: write
   packages: write
   security-events: write
 
@@ -24,6 +24,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate Semantic Version & Bump Tag
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch
+          initial_version: 0.2.0
+          release_branches: main
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -35,6 +46,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
+            type=raw,value=${{ steps.tag_version.outputs.new_tag }}
+            type=raw,value=${{ steps.tag_version.outputs.new_version }}
             type=sha,format=short
 
       - name: Log in to GitHub Container Registry
@@ -77,3 +90,11 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: steps.tag_version.outputs.new_tag != ''
+        with:
+          tag_name: ${{ steps.tag_version.outputs.new_tag }}
+          name: Release ${{ steps.tag_version.outputs.new_tag }}
+          body: ${{ steps.tag_version.outputs.changelog }}

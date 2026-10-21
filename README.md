@@ -177,11 +177,12 @@ python -m src.main --connector bonpreu --dry-run
 
 El projecte disposa d'un pipeline complet i automatitzat de **DevSecOps** mitjançant **GitHub Actions**:
 
-1. **Docker Build & Push**: Construcció multi-etapa amb Buildx i publicació directa a GitHub Container Registry (`ghcr.io/vdk84/subministres-etl:latest`).
-2. **Trivy Container Scanner**: Escaneig de vulnerabilitats (CVEs) a les capes de la imatge i publicació d'informes SARIF a la pestanya Security de GitHub.
-3. **GitHub CodeQL (SAST)**: Anàlisi de seguretat de codi per a Python executat en cada commit i setmanalment.
-4. **SonarCloud**: Anàlisi continu de qualitat, mantenibilitat i *code smells*.
-5. **Dependabot**: Alertes i Pull Requests automàtics per a actualitzacions de dependències de Python i Actions.
+1. **Semantic Versioning (SemVer) & GitHub Releases**: Increment automàtic de versió seguint *Conventional Commits* (`feat:` ➔ minor, `fix:` ➔ patch, `BREAKING CHANGE:` ➔ major), creació de Git Tags (`vX.Y.Z`) i publicació de Releases a GitHub amb Changelog generat.
+2. **Docker Build & Push**: Construcció multi-etapa amb Buildx i publicació directa a GitHub Container Registry amb múltiples etiquetes (`latest`, `vX.Y.Z`, `X.Y.Z`, `sha-<curt>`).
+3. **Trivy Container Scanner**: Escaneig de vulnerabilitats (CVEs) a les capes de la imatge i publicació d'informes SARIF a la pestanya Security de GitHub.
+4. **GitHub CodeQL (SAST)**: Anàlisi de seguretat de codi per a Python executat en cada commit i setmanalment.
+5. **SonarCloud**: Anàlisi continu de qualitat, mantenibilitat i *code smells*.
+6. **Dependabot**: Alertes i Pull Requests automàtics per a actualitzacions de dependències agrupades per evitar conflictes.
 
 ```bash
 # Construcció local manual (opcional)
