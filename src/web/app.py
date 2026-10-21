@@ -1,6 +1,9 @@
 # pyright: reportMissingImports=false
+import email
+import io
 import logging
 import os
+import zipfile
 from collections import deque
 from datetime import date, datetime
 from pathlib import Path
@@ -19,8 +22,9 @@ from src.connectors import (
     DigiConnector,
     VeoliaConnector,
 )
-from src.email_client import imap_client
+from src.email_client import decode_str, imap_client
 from src.models import FacturaMetriques, FacturaResult
+from src.pdf_parser import extract_text_from_pdf_bytes
 
 # Logger i buffer circular per als logs de la interfície
 logger = logging.getLogger("web_app")
@@ -425,42 +429,156 @@ async def get_connector_history(connector: str):
     return HTMLResponse(modal_html)
 
 
+def detect_provider_from_content(pdf_bytes: bytes, filename: str) -> str:
+    """Detecta el proveïdor analitzant el nom de fitxer o el text del PDF."""
+    text = extract_text_from_pdf_bytes(pdf_bytes) or ""
+    combined = (filename + " " + text).lower()
+
+    if "bonpreu" in combined or "esclat" in combined:
+        return "bonpreu"
+    if "digi" in combined or "digimobil" in combined:
+        return "digi"
+    if "veolia" in combined or "agbar" in combined or "aigües" in combined or "aigues" in combined:
+        return "veolia"
+    if "catgas" in combined:
+        return "catgas"
+    return "bonpreu"
+
+
+def extract_pdfs_from_eml(eml_bytes: bytes) -> list[tuple[bytes, str, str | None]]:
+    """Extreu fitxers PDF d'un correu .eml, retornant (pdf_bytes, filename, provider_hint)."""
+    results: list[tuple[bytes, str, str | None]] = []
+    try:
+        msg = email.message_from_bytes(eml_bytes)
+        sender = decode_str(msg.get("From", ""))
+        subject = decode_str(msg.get("Subject", ""))
+        combined_meta = f"{sender} {subject}".lower()
+
+        provider_hint: str | None = None
+        if "bonpreu" in combined_meta:
+            provider_hint = "bonpreu"
+        elif "digi" in combined_meta:
+            provider_hint = "digi"
+        elif "veolia" in combined_meta or "agbar" in combined_meta:
+            provider_hint = "veolia"
+        elif "catgas" in combined_meta:
+            provider_hint = "catgas"
+
+        for part in msg.walk():
+            ct = part.get_content_type()
+            cd = str(part.get("Content-Disposition", "")).lower()
+            fname = part.get_filename()
+            if fname:
+                fname = decode_str(fname)
+
+            if "attachment" in cd or (fname and fname.lower().endswith(".pdf")):
+                payload = part.get_payload(decode=True)
+                if isinstance(payload, bytes):
+                    results.append((payload, fname or "adjunt.pdf", provider_hint))
+            elif ct == "message/rfc822" or (fname and fname.lower().endswith(".eml")):
+                sub_payload = part.get_payload(decode=True)
+                if isinstance(sub_payload, bytes):
+                    results.extend(extract_pdfs_from_eml(sub_payload))
+    except (TypeError, ValueError, OSError) as e:
+        logger.warning(f"Error parsejant fitxer EML: {e}")
+    return results
+
+
 @app.post("/api/upload")
-async def upload_invoice_pdf(
+async def upload_invoice_files(
     file: Annotated[UploadFile, File()],
-    proveidor: Annotated[str, Form()],
+    proveidor: Annotated[str, Form(default="auto")],
 ):
-    """Pujada manual de factura PDF (Dropzone / Drag & Drop)."""
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="El fitxer ha de ser un PDF vàlid.")
+    """Pujada manual de factures (Dropzone): admet PDF, EML o ZIP (amb múltiples PDFs/EMLs)."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Nom de fitxer no proporcionat.")
+
+    fname_lower = file.filename.lower()
+    if not fname_lower.endswith((".pdf", ".eml", ".zip")):
+        raise HTTPException(
+            status_code=400,
+            detail="Format no admès. Només es permeten fitxers .pdf, .eml o .zip.",
+        )
 
     content = await file.read()
     if len(content) == 0:
-        raise HTTPException(status_code=400, detail="El fitxer PDF és buit.")
+        raise HTTPException(status_code=400, detail="El fitxer és buit.")
 
     connectors = get_all_connectors_map()
-    connector = connectors.get(proveidor.lower())
-    if not connector:
-        raise HTTPException(status_code=400, detail=f"Proveïdor '{proveidor}' desconegut.")
 
-    logger.info(f"Processant pujada manual de factura {file.filename} per al proveïdor {proveidor.upper()}")
+    # Recollir tots els PDFs a processar: llista de (pdf_bytes, filename, provider_hint)
+    pdf_queue: list[tuple[bytes, str, str | None]] = []
 
-    metriques = connector.extract_metrics_from_pdf(content)
-    if not metriques:
-        metriques = FacturaMetriques(
-            proveidor=connector.name,
-            tipus=connector.tipus,
-            numero_factura=f"MANUAL-{date.today().strftime('%Y%m%d')}",
-            data_emissio=date.today(),
-            import_total=0.0,
+    if fname_lower.endswith(".zip"):
+        logger.info(f"Desempaquetant fitxer ZIP: {file.filename}")
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as z:
+                for zinfo in z.infolist():
+                    if zinfo.is_dir():
+                        continue
+                    inner_name = zinfo.filename.lower()
+                    if inner_name.endswith(".pdf"):
+                        pdf_data = z.read(zinfo)
+                        pdf_queue.append((pdf_data, Path(zinfo.filename).name, None))
+                    elif inner_name.endswith(".eml"):
+                        eml_data = z.read(zinfo)
+                        pdf_queue.extend(extract_pdfs_from_eml(eml_data))
+        except zipfile.BadZipFile:
+            raise HTTPException(status_code=400, detail="El fitxer ZIP no és vàlid o està malmès.")
+    elif fname_lower.endswith(".eml"):
+        logger.info(f"Processant fitxer EML: {file.filename}")
+        pdf_queue.extend(extract_pdfs_from_eml(content))
+    else:
+        # PDF individual
+        pdf_queue.append((content, file.filename, None))
+
+    if not pdf_queue:
+        return HTMLResponse(
+            '<div class="p-4 text-sm text-yellow-800 rounded-lg bg-yellow-50 dark:bg-gray-800 dark:text-yellow-300">'
+            "⚠️ No s'ha trobat cap factura en PDF vàlida dins del fitxer pujat.</div>"
         )
 
-    _ = connector.save_and_ingest(content, metriques, origen="manual_web_upload")
+    # Processar cada PDF de la cua
+    total_processats = 0
+    nous_descarregats = 0
+    ja_existents = 0
+    total_import = 0.0
 
-    msg = f"Factura '{file.filename}' processada i desada correctament al NAS Samba per a {proveidor.upper()}."
+    for pdf_bytes, filename, hint in pdf_queue:
+        # Determinar el proveïdor (hint, manual o autodetectat)
+        target_prov = proveidor.lower()
+        if target_prov == "auto" or target_prov not in connectors:
+            target_prov = hint or detect_provider_from_content(pdf_bytes, filename)
+
+        conn = connectors.get(target_prov, connectors["bonpreu"])
+        metriques = conn.extract_metrics_from_pdf(pdf_bytes)
+
+        if not metriques:
+            metriques = FacturaMetriques(
+                proveidor=conn.name,
+                tipus=conn.tipus,
+                numero_factura=f"MANUAL-{filename.replace('.pdf', '')}",
+                data_emissio=date.today(),
+                import_total=0.0,
+            )
+
+        res = conn.save_and_ingest(pdf_bytes, metriques, origen="manual_web_upload")
+        total_processats += 1
+        if res.nou_descarregat:
+            nous_descarregats += 1
+        else:
+            ja_existents += 1
+
+        total_import += metriques.import_total
+
+    summary = (
+        f"🎉 S'han processat amb èxit <strong>{total_processats}</strong> factures "
+        f"(<strong>{nous_descarregats}</strong> noves desades al NAS, {ja_existents} ja existents omeses). "
+        f"Import total registrat a InfluxDB: <strong>{total_import:.2f} €</strong>."
+    )
     return HTMLResponse(
-        f'<div class="p-4 text-sm text-green-800 rounded-lg bg-green-50 dark:bg-gray-800 dark:text-green-400">'
-        f"✅ {msg} (Total: {metriques.import_total:.2f} €)</div>"
+        f'<div class="p-4 text-sm text-emerald-800 rounded-lg bg-emerald-50 dark:bg-gray-800 dark:text-emerald-400">'
+        f"✅ {summary}</div>"
     )
 
 

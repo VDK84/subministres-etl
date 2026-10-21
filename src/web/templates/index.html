@@ -167,9 +167,9 @@
         <div>
           <h2 class="text-lg font-semibold text-white flex items-center gap-2">
             <i data-lucide="upload-cloud" class="w-5 h-5 text-blue-400"></i>
-            Pujada Manual de Factures (Dropzone)
+            Pujada de Factures (PDF, EML o ZIP)
           </h2>
-          <p class="text-xs text-slate-400">Si un mes descarregues la factura manualment, arrossega el PDF aquí per parsejar-lo, desar-lo al NAS i enviar mètriques a InfluxDB.</p>
+          <p class="text-xs text-slate-400">Arrossega factures en PDF, fitxers de correu .EML o un fitxer .ZIP complet (amb múltiples PDFs o EMLs). El sistema els desempaqueta i classifica automàticament.</p>
         </div>
       </div>
 
@@ -184,17 +184,18 @@
             <i data-lucide="file-up" class="w-6 h-6 text-emerald-400"></i>
           </div>
           <div>
-            <label class="block text-sm font-medium text-slate-200 mb-1">Selecciona o arrossega un fitxer PDF</label>
-            <input type="file" name="file" accept="application/pdf" required class="text-xs text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-slate-800 file:text-slate-200 hover:file:bg-slate-700 cursor-pointer">
+            <label class="block text-sm font-medium text-slate-200 mb-1">Selecciona o arrossega fitxers (.pdf, .eml, .zip)</label>
+            <input type="file" name="file" accept=".pdf,.eml,.zip,application/pdf,application/zip" required class="text-xs text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-slate-800 file:text-slate-200 hover:file:bg-slate-700 cursor-pointer">
           </div>
 
           <div class="flex items-center justify-center gap-3 pt-2">
             <span class="text-xs text-slate-400">Proveïdor:</span>
             <select name="proveidor" class="bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-1.5 focus:ring-emerald-500 focus:border-emerald-500">
+              <option value="auto">🔍 Detecció automàtica</option>
+              <option value="catgas">Catgas (Gas Natural)</option>
+              <option value="veolia">Veolia (Aigua)</option>
               <option value="bonpreu">Bonpreu Energia (Electricitat)</option>
               <option value="digi">Digi Mobil (Telefonia / Fibra)</option>
-              <option value="veolia">Veolia (Aigua)</option>
-              <option value="catgas">Catgas (Gas Natural)</option>
             </select>
 
             <button type="submit" class="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium rounded-lg shadow transition">
