@@ -216,7 +216,7 @@ class BonpreuConnector(BaseConnector):
                             # PLA A: Intentar recuperar el codi 2FA automàticament de la bústia IMAP
                             if not code_to_use and imap_client and imap_client.is_configured():
                                 self.logger.info("Intentant extreure el codi 2FA de la bústia de correu (Pla A)...")
-                                code_to_use = self._fetch_otp_code_from_email(imap_client, timeout_seconds=35)
+                                code_to_use = self._fetch_otp_code_from_email(imap_client, timeout_seconds=75)
 
                             # Si tenim el codi (automàtic o proporcionat per l'usuari)
                             if code_to_use:
@@ -291,11 +291,11 @@ class BonpreuConnector(BaseConnector):
     def _fetch_otp_code_from_email(
         self,
         imap_client: ImapMailboxClient,
-        timeout_seconds: int = 35,
+        timeout_seconds: int = 75,
     ) -> str | None:
         """Cerca el codi 2FA de 6 dígits enviat per Bonpreu a la bústia IMAP."""
         start_time = time.time()
-        self.logger.info("Esperant arribada del correu 2FA de Bonpreu...")
+        self.logger.info(f"Esperant arribada del correu 2FA de Bonpreu (fins a {timeout_seconds}s)...")
         while time.time() - start_time < timeout_seconds:
             emails = imap_client.fetch_recent_emails(
                 sender_filters=["bonpreu", "info@bonpreu.cat"],
