@@ -1,7 +1,10 @@
 # pyright: reportMissingImports=false
 import logging
 import re
+import time
 from datetime import date
+from pathlib import Path
+from typing import Any
 
 try:
     from playwright.sync_api import Error as PlaywrightError
@@ -48,7 +51,7 @@ class BonpreuConnector(BaseConnector):
         "factura@energia.bonpreu.cat",
     )
 
-    PORTAL_LOGIN_URL = "https://clients.energia.bonpreu.cat/login"
+    PORTAL_LOGIN_URL = "https://energia.bonpreuesclat.cat/"
 
     def is_enabled(self) -> bool:
         return settings.BONPREU_ENABLED
@@ -123,7 +126,7 @@ class BonpreuConnector(BaseConnector):
             return results
 
         self.logger.info("Iniciant descàrrega de factures des del portal de Bonpreu Energia...")
-        pdf_list = self.fetch_invoices_from_portal(limit=fetch_limit)
+        pdf_list = self.fetch_invoices_from_portal(imap_client=imap_client, limit=fetch_limit)
         for pdf_bytes, filename in pdf_list:
             metriques = self.extract_metrics_from_pdf(pdf_bytes)
             if metriques:
@@ -134,8 +137,13 @@ class BonpreuConnector(BaseConnector):
 
         return results
 
-    def fetch_invoices_from_portal(self, limit: int | None = 3) -> list[tuple[bytes, str]]:
-        """Autenticació al portal de Bonpreu via Playwright headless per descarregar factures PDF."""
+    def fetch_invoices_from_portal(
+        self,
+        imap_client: ImapMailboxClient | None = None,
+        limit: int | None = 3,
+        otp_code: str | None = None,
+    ) -> list[tuple[bytes, str]]:
+        """Autenticació a Bonpreu Energia via Keycloak, suport 2FA (IMAP automàtic + manual) i sessió NAS."""
         downloaded: list[tuple[bytes, str]] = []
         if self.is_in_cooldown():
             return downloaded
@@ -146,36 +154,107 @@ class BonpreuConnector(BaseConnector):
             )
             return downloaded
 
-        portal_url = settings.BONPREU_PORTAL_URL
+        session_dir = Path(settings.NAS_MOUNT_PATH) / ".sessions"
+        session_file = session_dir / "bonpreu_session.json"
+        try:
+            session_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+        portal_url = settings.BONPREU_PORTAL_URL or self.PORTAL_LOGIN_URL
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=settings.HEADLESS_BROWSER)
                 try:
-                    context = browser.new_context(accept_downloads=True)
+                    context_kwargs: dict[str, Any] = {"accept_downloads": True}
+                    if session_file.exists():
+                        self.logger.info("Carregant sessió prèvia de Bonpreu des del NAS...")
+                        context_kwargs["storage_state"] = str(session_file)
+
+                    context = browser.new_context(**context_kwargs)
                     page = context.new_page()
 
-                    self.logger.info(f"Obrint pàgina d'inici de sessió de Bonpreu: {portal_url}")
+                    self.logger.info(f"Obrint portal de Bonpreu Energia: {portal_url}")
                     page.goto(portal_url, timeout=settings.SCRAPER_TIMEOUT_MS)
-
-                    # Omplir formulari de credencials
-                    page.fill(
-                        "input[type='email'], input[name='username'], input[name='login']", settings.BONPREU_USER or ""
-                    )
-                    page.fill("input[type='password'], input[name='password']", settings.BONPREU_PASSWORD or "")
-                    page.click("button[type='submit'], input[type='submit']")
-
                     page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
 
-                    # Navegar a l'apartat de factures si cal
+                    # 1. Acceptar cookies si apareix el diàleg d'OneTrust
+                    try:
+                        cookie_btn = page.query_selector(
+                            "#accept-recommended-btn-handler, button:has-text('Acceptar-ho tot')"
+                        )
+                        if cookie_btn and cookie_btn.is_visible():
+                            cookie_btn.click()
+                    except (PlaywrightError, OSError):
+                        pass
+
+                    # 2. Si ens redirigeix al Keycloak de Bonpreu, cal fer login
+                    if (
+                        "keycloak" in page.url.lower()
+                        or "login" in page.url.lower()
+                        or page.query_selector("#kc-form-login")
+                    ):
+                        self.logger.info("Sessió no activa a Bonpreu. Iniciant procés de login a Keycloak...")
+
+                        # Omplir formulari de credencials
+                        page.fill("input#username, input[name='username']", settings.BONPREU_USER or "")
+                        page.fill("input#password, input[name='password']", settings.BONPREU_PASSWORD or "")
+                        page.click("button.accedeix, button[type='submit']")
+                        page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+
+                        # 3. Detecció de pantalla de 2FA (Verifica la teva identitat / kc-email-totp-code-login-form)
+                        is_2fa = (
+                            "email-totp" in page.url.lower()
+                            or page.query_selector("#kc-email-totp-code-login-form") is not None
+                            or page.query_selector("input#code") is not None
+                        )
+
+                        if is_2fa:
+                            self.logger.info("🔐 Bonpreu sol·licita verificació 2FA...")
+                            code_to_use = otp_code
+
+                            # PLA A: Intentar recuperar el codi 2FA automàticament de la bústia IMAP
+                            if not code_to_use and imap_client and imap_client.is_configured():
+                                self.logger.info("Intentant extreure el codi 2FA de la bústia de correu (Pla A)...")
+                                code_to_use = self._fetch_otp_code_from_email(imap_client, timeout_seconds=35)
+
+                            # Si tenim el codi (automàtic o proporcionat per l'usuari)
+                            if code_to_use:
+                                self.logger.info(f"Aplicant codi 2FA a Bonpreu: {code_to_use}")
+                                page.fill("input#code", code_to_use)
+                                page.click(".verify-button, button[type='submit']")
+                                page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+                            else:
+                                # PLA B: Fallback / Pendent de 2FA
+                                self.logger.warning(
+                                    "🔐 No s'ha pogut obtenir el codi 2FA automàticament. "
+                                    "Estat: 'Pendent de 2FA'. Pots introduir el codi manualment des de la web."
+                                )
+                                try:
+                                    screenshot_path = session_dir / "bonpreu_2fa_prompt.png"
+                                    page.screenshot(path=str(screenshot_path))
+                                except (OSError, RuntimeError):
+                                    pass
+                                return downloaded
+
+                    # 4. Si hem superat el login amb èxit, desem la sessió al NAS
+                    if "keycloak" not in page.url.lower():
+                        try:
+                            context.storage_state(path=str(session_file))
+                            self.logger.info("✅ Sessió de Bonpreu desada al NAS per a futures execucions!")
+                        except (OSError, RuntimeError):
+                            pass
+
+                    # 5. Navegar a l'apartat de factures si no hi som
                     if "factur" not in page.url.lower():
                         factura_link = page.query_selector("a[href*='factur'], button:has-text('Factur')")
                         if factura_link:
                             factura_link.click()
-                            page.wait_for_load_state("networkidle")
+                            page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
 
-                    # Cerca botons de descàrrega de PDF
+                    # 6. Cerca botons de descàrrega de PDF
                     download_buttons = page.query_selector_all(
-                        "a[href*='.pdf'], button:has-text('Descarregar'), a:has-text('PDF')"
+                        "a[href*='.pdf'], button:has-text('Descarregar'), a:has-text('PDF'), button:has-text('PDF')"
                     )
                     max_dl = limit or 3
                     self.logger.info(
@@ -195,13 +274,13 @@ class BonpreuConnector(BaseConnector):
                             self.logger.warning(f"No s'ha pogut descarregar el botó {i}: {err}")
 
                 except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as page_err:
-                    self.record_failure(f"Error de navegació o resolució: {page_err}")
+                    self.record_failure(f"Error de navegació a Bonpreu: {page_err}")
                     self.logger.error(f"Error navegant al portal de Bonpreu: {page_err}")
                 finally:
                     browser.close()
 
         except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as e:
-            self.record_failure(f"Error de Playwright: {e}")
+            self.record_failure(f"Error de Playwright a Bonpreu: {e}")
             self.logger.error(f"Error durant el web scraping de Bonpreu: {e}")
 
         if downloaded:
@@ -209,10 +288,31 @@ class BonpreuConnector(BaseConnector):
 
         return downloaded
 
-        if downloaded:
-            self.record_success()
-
-        return downloaded
+    def _fetch_otp_code_from_email(
+        self,
+        imap_client: ImapMailboxClient,
+        timeout_seconds: int = 35,
+    ) -> str | None:
+        """Cerca el codi 2FA de 6 dígits enviat per Bonpreu a la bústia IMAP."""
+        start_time = time.time()
+        self.logger.info("Esperant arribada del correu 2FA de Bonpreu...")
+        while time.time() - start_time < timeout_seconds:
+            emails = imap_client.fetch_recent_emails(
+                sender_filters=["bonpreu", "info@bonpreu.cat"],
+                days_back=1,
+            )
+            for em in emails:
+                subject_clean = em.subject.lower()
+                body_clean = em.body_text
+                # Comprovar si és el correu de verificació d'identitat
+                if "identitat" in subject_clean or "verificaci" in subject_clean or "código" in subject_clean:
+                    match = re.search(r"\b(\d{6})\b", body_clean)
+                    if match:
+                        code = match.group(1)
+                        self.logger.info(f"✅ Codi 2FA de Bonpreu capturat del correu: {code}")
+                        return code
+            time.sleep(3)
+        return None
 
     def extract_metrics_from_pdf(self, pdf_bytes: bytes) -> FacturaMetriques | None:
         """Extreu mètriques detallades del PDF oficial de Bonpreu Esclat Energia."""
