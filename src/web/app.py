@@ -1,10 +1,12 @@
 # pyright: reportMissingImports=false
 import logging
+import os
 from collections import deque
 from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
+import requests
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
@@ -42,6 +44,51 @@ app = FastAPI(title="Subministres ETL", version=settings.APP_VERSION)
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+def auto_annotate_k8s_pod() -> None:
+    """Anota automàticament el Pod actual a Kubernetes amb la versió SemVer de l'aplicació."""
+    pod_name = os.getenv("HOSTNAME")
+    if not pod_name:
+        return
+
+    token_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
+    if not token_path.exists():
+        logger.debug("Execució fora de Kubernetes. Ometent auto-anotació del Pod.")
+        return
+
+    token = token_path.read_text().strip()
+    ns_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+    namespace = ns_path.read_text().strip() if ns_path.exists() else "subministres"
+    ca_cert = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+    url = f"https://kubernetes.default.svc/api/v1/namespaces/{namespace}/pods/{pod_name}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/strategic-merge-patch+json",
+    }
+    payload = {"metadata": {"annotations": {"app.kubernetes.io/version": f"v{settings.APP_VERSION}"}}}
+
+    try:
+        resp = requests.patch(
+            url,
+            json=payload,
+            headers=headers,
+            verify=ca_cert if Path(ca_cert).exists() else False,
+            timeout=5,
+        )
+        if resp.status_code in (200, 201):
+            logger.info(f"✅ Pod {pod_name} auto-anotat a Kubernetes amb versió: v{settings.APP_VERSION}")
+        else:
+            logger.warning(f"No s'ha pogut auto-anotar el Pod (HTTP {resp.status_code}): {resp.text}")
+    except (OSError, RuntimeError, requests.exceptions.RequestException) as err:
+        logger.warning(f"Error intentant auto-anotar el Pod a Kubernetes: {err}")
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    auto_annotate_k8s_pod()
+
 
 # Estat d'execució global
 execution_state: dict[str, Any] = {
