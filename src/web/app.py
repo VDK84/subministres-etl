@@ -487,7 +487,7 @@ def extract_pdfs_from_eml(eml_bytes: bytes) -> list[tuple[bytes, str, str | None
 @app.post("/api/upload")
 async def upload_invoice_files(
     file: Annotated[UploadFile, File()],
-    proveidor: Annotated[str, Form(default="auto")],
+    proveidor: Annotated[str, Form()] = "auto",
 ):
     """Pujada manual de factures (Dropzone): admet PDF, EML o ZIP (amb múltiples PDFs/EMLs)."""
     if not file.filename:
