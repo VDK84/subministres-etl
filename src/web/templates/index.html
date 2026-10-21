@@ -217,13 +217,32 @@
           <p class="text-xs text-slate-400">Fitxers PDF guardats a <code class="text-emerald-400/90 font-mono">{{ settings.NAS_MOUNT_PATH }}</code></p>
         </div>
 
-        <div class="flex items-center gap-2">
+        <div class="flex flex-wrap items-center gap-3">
+          <!-- Comptador dinàmic de factures -->
+          <span class="text-xs px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 font-mono flex items-center gap-1.5">
+            <i data-lucide="files" class="w-3.5 h-3.5 text-emerald-400"></i>
+            <span>Mostrant <strong id="visible-count" class="text-white">{{ invoices|length }}</strong> de {{ invoices|length }}</span>
+          </span>
+
+          <!-- Desplegable per filtrar per proveïdor -->
+          <select 
+            id="provider-filter" 
+            onchange="filterInvoices()"
+            class="bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:border-emerald-500 outline-none cursor-pointer">
+            <option value="all">Tots els proveïdors</option>
+            <option value="catgas">Catgas (Gas)</option>
+            <option value="veolia">Veolia (Aigua)</option>
+            <option value="bonpreu">Bonpreu (Llum)</option>
+            <option value="digi">Digi (Telefonia)</option>
+          </select>
+
+          <!-- Cercador de text -->
           <input 
             type="text" 
             id="search-input" 
             placeholder="Cercar factura..." 
             onkeyup="filterInvoices()"
-            class="bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:border-emerald-500 outline-none w-52">
+            class="bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:border-emerald-500 outline-none w-48">
         </div>
       </div>
 
@@ -393,20 +412,85 @@
       }
     }
 
-    function openHistoryModal() {
+    // -------------------------------------------------------------
+    // Gestió del Modal d'Històric amb Temporitzador i Feedback en Viu
+    // -------------------------------------------------------------
+    let historyTimerInterval = null;
+    let historySeconds = 0;
+
+    function openHistoryModal(connectorName) {
       const modal = document.querySelector('#history-modal');
       const content = document.querySelector('#history-modal-content');
-      if (modal && content) {
-        content.innerHTML = `
-          <div class="p-8 text-center text-slate-400 flex flex-col items-center justify-center gap-3">
-            <div class="w-8 h-8 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin"></div>
-            <span>Consultant factures disponibles a la companyia...</span>
-          </div>`;
-        modal.classList.remove('hidden');
-      }
+      if (!modal || !content) return;
+
+      historySeconds = 0;
+      clearInterval(historyTimerInterval);
+
+      // Contingut visual de càrrega amb temporitzador i botó de cancel·lació immediat
+      content.innerHTML = `
+        <div class="p-8 text-center space-y-6">
+          <div class="relative w-16 h-16 mx-auto flex items-center justify-center">
+            <div class="w-16 h-16 border-4 border-slate-800 border-t-emerald-400 rounded-full animate-spin"></div>
+            <span id="history-timer" class="absolute font-mono text-xs font-bold text-emerald-400">0s</span>
+          </div>
+          <div>
+            <h4 class="text-base font-bold text-white">Consultant factures a la companyia...</h4>
+            <p class="text-xs text-slate-400 mt-1">S'estan comprovant els missatges i fitxers disponibles. Això sol trigar entre 5 i 20 segons.</p>
+          </div>
+
+          <!-- Mini consola de logs en directe dins del propi modal -->
+          <div class="bg-slate-950 border border-slate-800 rounded-xl p-3 text-left font-mono text-[11px] text-slate-300 max-h-32 overflow-y-auto space-y-1 shadow-inner" id="modal-live-logs">
+            <div class="text-emerald-400/90 flex items-center gap-1.5">
+              <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+              <span>Iniciant connexió segura...</span>
+            </div>
+          </div>
+
+          <div id="history-timeout-alert" class="hidden text-xs px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-300">
+            ⚠️ La consulta està trigant més de l'habitual. Pots continuar esperant o tancar la finestra si prefereixes provar-ho més tard.
+          </div>
+
+          <div class="pt-2">
+            <button type="button" onclick="closeHistoryModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 active:scale-95 text-slate-300 text-xs font-medium rounded-xl border border-slate-700 transition">
+              ✕ Cancel·lar o tancar finestra
+            </button>
+          </div>
+        </div>`;
+
+      modal.classList.remove('hidden');
+
+      // Iniciar el temporitzador
+      historyTimerInterval = setInterval(() => {
+        historySeconds++;
+        const timerElem = document.querySelector('#history-timer');
+        if (timerElem) {
+          timerElem.textContent = historySeconds + 's';
+        }
+
+        // Duplicar darrers logs cap al mini-visor del modal
+        const mainLogs = document.querySelector('#logs-container');
+        const modalLogs = document.querySelector('#modal-live-logs');
+        if (mainLogs && modalLogs && mainLogs.children.length > 0) {
+          const lastLog = mainLogs.lastElementChild.textContent;
+          if (lastLog && !modalLogs.textContent.includes(lastLog)) {
+            const entry = document.createElement('div');
+            entry.className = 'text-slate-300 truncate';
+            entry.textContent = lastLog;
+            modalLogs.appendChild(entry);
+            modalLogs.scrollTop = modalLogs.scrollHeight;
+          }
+        }
+
+        // Avís visual si passen més de 30 segons
+        if (historySeconds >= 30) {
+          const alertElem = document.querySelector('#history-timeout-alert');
+          if (alertElem) alertElem.classList.remove('hidden');
+        }
+      }, 1000);
     }
 
     function closeHistoryModal() {
+      clearInterval(historyTimerInterval);
       const modal = document.querySelector('#history-modal');
       if (modal) {
         modal.classList.add('hidden');
@@ -421,7 +505,6 @@
 
     function selectOnlyPending() {
       document.querySelectorAll('.bulk-cb').forEach(cb => {
-        // Seleccionar només les que tenen el badge groc de pendent
         const row = cb.closest('tr');
         if (row && row.textContent.includes('Pendent')) {
           cb.checked = true;
@@ -432,20 +515,66 @@
     }
 
     function filterInvoices() {
-      const searchInput = document.querySelector('#search-input');
-      const q = searchInput ? searchInput.value.toLowerCase() : '';
+      const q = document.querySelector('#search-input')?.value.toLowerCase() || '';
+      const prov = document.querySelector('#provider-filter')?.value.toLowerCase() || 'all';
       const rows = document.querySelectorAll('.invoice-row');
+      let visibleCount = 0;
+
       rows.forEach(r => {
-        const text = r.textContent ? r.textContent.toLowerCase() : '';
-        r.style.display = text.includes(q) ? '' : 'none';
+        const text = r.textContent?.toLowerCase() || '';
+        const rProv = r.querySelector('td:first-child')?.textContent?.toLowerCase().trim() || '';
+
+        const matchesText = text.includes(q);
+        const matchesProv = (prov === 'all') || (rProv === prov);
+
+        if (matchesText && matchesProv) {
+          r.style.display = '';
+          visibleCount++;
+        } else {
+          r.style.display = 'none';
+        }
       });
+
+      const countElem = document.querySelector('#visible-count');
+      if (countElem) {
+        countElem.textContent = visibleCount;
+      }
     }
 
-    // Auto-scroll per als logs
+    // Netejar temporitzador quan HTMX carrega la resposta
     document.body.addEventListener('htmx:afterSwap', function(evt) {
       lucide.createIcons();
+      if (evt.detail && evt.detail.target && evt.detail.target.id === 'history-modal-content') {
+        clearInterval(historyTimerInterval);
+      }
       if (evt.detail && evt.detail.target && evt.detail.target.id === 'logs-container') {
         evt.detail.target.scrollTop = evt.detail.target.scrollHeight;
+      }
+    });
+
+    // Gestió d'errors HTMX: si el backend dona error 500 o timeout, mostrar-ho de forma amigable en comptes de penjar la interfície
+    document.body.addEventListener('htmx:responseError', function(evt) {
+      if (evt.detail && evt.detail.target && evt.detail.target.id === 'history-modal-content') {
+        clearInterval(historyTimerInterval);
+        const content = document.querySelector('#history-modal-content');
+        if (content) {
+          content.innerHTML = `
+            <div class="p-8 text-center space-y-5">
+              <div class="w-12 h-12 mx-auto rounded-full bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-400">
+                <i data-lucide="alert-triangle" class="w-6 h-6"></i>
+              </div>
+              <div>
+                <h4 class="text-base font-bold text-white">No s'han pogut carregar les factures</h4>
+                <p class="text-xs text-slate-400 mt-1">El servidor ha retornat un error o la connexió ha superat el temps d'espera.</p>
+              </div>
+              <div class="pt-2">
+                <button type="button" onclick="closeHistoryModal()" class="px-5 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold rounded-xl border border-slate-700 transition">
+                  Tancar finestra
+                </button>
+              </div>
+            </div>`;
+          lucide.createIcons();
+        }
       }
     });
   </script>
