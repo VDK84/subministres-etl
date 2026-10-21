@@ -30,6 +30,7 @@ class ParsedEmail:
     date: datetime | None
     body_text: str
     attachments: list[EmailAttachment] = field(default_factory=list)
+    nested_emails: list["ParsedEmail"] = field(default_factory=list)
 
 
 def decode_str(header_value: Any) -> str:
@@ -97,15 +98,17 @@ class ImapMailboxClient:
                     sender = decode_str(msg.get("From", ""))
                     subject = decode_str(msg.get("Subject", ""))
 
-                    # Filtratge per remitent o assumpte (suporta correus reenviats Fwd:)
-                    if sender_filters:
-                        matches_sender = any(f.lower() in sender.lower() for f in sender_filters)
-                        matches_subject = any(f.lower() in subject.lower() for f in sender_filters)
-                        if not matches_sender and not matches_subject:
-                            continue
-
                     parsed = self._parse_message(mail_id.decode("utf-8"), msg, sender, subject)
-                    emails.append(parsed)
+
+                    # Comprovar si el missatge principal o algun dels missatges .eml imbricats coincideix
+                    candidate_messages = [parsed] + parsed.nested_emails
+                    for cand in candidate_messages:
+                        if sender_filters:
+                            matches_sender = any(f.lower() in cand.sender.lower() for f in sender_filters)
+                            matches_subject = any(f.lower() in cand.subject.lower() for f in sender_filters)
+                            if not matches_sender and not matches_subject:
+                                continue
+                        emails.append(cand)
 
         except (imaplib.IMAP4.error, OSError) as e:
             logger.error(f"Error connectant o llegint del servidor IMAP: {e}")
@@ -121,6 +124,7 @@ class ImapMailboxClient:
     ) -> ParsedEmail:
         body_text_parts: list[str] = []
         attachments: list[EmailAttachment] = []
+        nested_emails: list[ParsedEmail] = []
 
         date_hdr = msg.get("Date")
         date_obj: datetime | None = None
@@ -139,7 +143,41 @@ class ImapMailboxClient:
                 if filename:
                     filename = decode_str(filename)
 
-                if "attachment" in content_disposition.lower() or (filename and filename.lower().endswith(".pdf")):
+                # 1. Desempaquetat recursiu de correus adjunts en format .eml o message/rfc822
+                if content_type == "message/rfc822" or (filename and filename.lower().endswith(".eml")):
+                    try:
+                        sub_msg: email.message.Message | None = None
+                        if content_type == "message/rfc822":
+                            sub_payload = part.get_payload()
+                            if (
+                                isinstance(sub_payload, list)
+                                and len(sub_payload) > 0
+                                and isinstance(sub_payload[0], email.message.Message)
+                            ):
+                                sub_msg = sub_payload[0]
+                            elif isinstance(sub_payload, bytes):
+                                sub_msg = email.message_from_bytes(sub_payload)
+                        elif filename and filename.lower().endswith(".eml"):
+                            raw_bytes = part.get_payload(decode=True)
+                            if isinstance(raw_bytes, bytes):
+                                sub_msg = email.message_from_bytes(raw_bytes)
+
+                        if sub_msg:
+                            sub_sender = decode_str(sub_msg.get("From", ""))
+                            sub_subject = decode_str(sub_msg.get("Subject", ""))
+                            nested_id = f"{msg_id}_{filename or 'nested'}"
+                            sub_parsed = self._parse_message(nested_id, sub_msg, sub_sender, sub_subject)
+                            nested_emails.append(sub_parsed)
+                            # També afegim directament els seus PDFs a aquest correu
+                            attachments.extend(sub_parsed.attachments)
+                            logger.info(
+                                f"Extret correu .eml adjunt: '{sub_subject}' de '{sub_sender}' ({len(sub_parsed.attachments)} PDFs)"
+                            )
+                    except (TypeError, ValueError, OSError) as eml_err:
+                        logger.warning(f"Error parsejant correu .eml adjunt: {eml_err}")
+
+                # 2. Adjunts normals en format PDF
+                elif "attachment" in content_disposition.lower() or (filename and filename.lower().endswith(".pdf")):
                     payload = part.get_payload(decode=True)
                     if isinstance(payload, bytes):
                         attachments.append(
@@ -169,6 +207,7 @@ class ImapMailboxClient:
             date=date_obj,
             body_text=body_text,
             attachments=attachments,
+            nested_emails=nested_emails,
         )
 
 
