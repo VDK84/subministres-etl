@@ -176,14 +176,25 @@ class ImapMailboxClient:
                     except (TypeError, ValueError, OSError) as eml_err:
                         logger.warning(f"Error parsejant correu .eml adjunt: {eml_err}")
 
-                # 2. Adjunts normals en format PDF
-                elif "attachment" in content_disposition.lower() or (filename and filename.lower().endswith(".pdf")):
+                # 2. Adjunts normals en format PDF (validació per extensió i magic bytes %PDF)
+                elif filename and filename.lower().endswith(".pdf"):
                     payload = part.get_payload(decode=True)
-                    if isinstance(payload, bytes):
+                    if isinstance(payload, bytes) and payload.startswith(b"%PDF"):
+                        attachments.append(
+                            EmailAttachment(
+                                filename=filename,
+                                content_type=content_type or "application/pdf",
+                                data=payload,
+                            )
+                        )
+                elif "attachment" in content_disposition.lower():
+                    # Si està marcat com a attachment però no té nom .pdf, comprovem si és realment un PDF
+                    payload = part.get_payload(decode=True)
+                    if isinstance(payload, bytes) and payload.startswith(b"%PDF"):
                         attachments.append(
                             EmailAttachment(
                                 filename=filename or f"adjunt_{msg_id}.pdf",
-                                content_type=content_type,
+                                content_type="application/pdf",
                                 data=payload,
                             )
                         )

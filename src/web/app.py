@@ -471,9 +471,16 @@ def extract_pdfs_from_eml(eml_bytes: bytes) -> list[tuple[bytes, str, str | None
             if fname:
                 fname = decode_str(fname)
 
-            if "attachment" in cd or (fname and fname.lower().endswith(".pdf")):
+            is_pdf_name = bool(fname and fname.lower().endswith(".pdf"))
+            is_image = bool(
+                fname and fname.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp"))
+            )
+            if is_image:
+                continue
+
+            if is_pdf_name or "attachment" in cd:
                 payload = part.get_payload(decode=True)
-                if isinstance(payload, bytes):
+                if isinstance(payload, bytes) and payload.startswith(b"%PDF"):
                     results.append((payload, fname or "adjunt.pdf", provider_hint))
             elif ct == "message/rfc822" or (fname and fname.lower().endswith(".eml")):
                 sub_payload = part.get_payload(decode=True)
@@ -519,7 +526,8 @@ async def upload_invoice_files(
                     inner_name = zinfo.filename.lower()
                     if inner_name.endswith(".pdf"):
                         pdf_data = z.read(zinfo)
-                        pdf_queue.append((pdf_data, Path(zinfo.filename).name, None))
+                        if pdf_data.startswith(b"%PDF"):
+                            pdf_queue.append((pdf_data, Path(zinfo.filename).name, None))
                     elif inner_name.endswith(".eml"):
                         eml_data = z.read(zinfo)
                         pdf_queue.extend(extract_pdfs_from_eml(eml_data))
