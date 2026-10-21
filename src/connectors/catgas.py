@@ -94,12 +94,10 @@ class CatgasConnector(BaseConnector):
                 any_str = str(em.date.year) if em.date else str(date.today().year)
                 mes_str = f"{em.date.month:02d}" if em.date else "01"
 
-                # Intentem parsejar ràpidament o deduïm nom
+                # Deduïm el nom normalitzat del fitxer al NAS
+                clean_name = re.sub(r"[^A-Za-z0-9_-]", "_", att.filename.replace(".pdf", "").replace(".PDF", ""))
+                expected_filename = f"{any_str}_{mes_str}_{self.name}_{clean_name}.pdf"
                 parsed_amt = parse_euro_amount(em.subject) or parse_euro_amount(em.body_text) or 0.0
-                clean_name = re.sub(r"[^A-Za-z0-9_-]", "_", att.filename)
-                expected_filename = f"{any_str}_{mes_str}_{self.name}_{clean_name}"
-                if not expected_filename.endswith(".pdf"):
-                    expected_filename += ".pdf"
 
                 ja_al_nas = storage.exists(self.tipus.value, self.name, any_str, expected_filename)
                 invoices.append(

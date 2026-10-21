@@ -97,10 +97,11 @@ class ImapMailboxClient:
                     sender = decode_str(msg.get("From", ""))
                     subject = decode_str(msg.get("Subject", ""))
 
-                    # Filtratge per remitent si s'especifica
+                    # Filtratge per remitent o assumpte (suporta correus reenviats Fwd:)
                     if sender_filters:
                         matches_sender = any(f.lower() in sender.lower() for f in sender_filters)
-                        if not matches_sender:
+                        matches_subject = any(f.lower() in subject.lower() for f in sender_filters)
+                        if not matches_sender and not matches_subject:
                             continue
 
                     parsed = self._parse_message(mail_id.decode("utf-8"), msg, sender, subject)
