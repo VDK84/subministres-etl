@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = Field(default="INFO")
     DRY_RUN: bool = Field(default=False)
     DAYS_BACK: int = Field(default=60, description="Dies enrere per buscar correus o factures")
+    APP_VERSION: str = Field(default="0.3.3", description="Versió de l'aplicació")
 
     # Storage NAS Samba (Mount point al contenidor K8s)
     NAS_MOUNT_PATH: str = Field(default="/data/factures", description="Punt de muntatge del share Samba al contenidor")
@@ -53,7 +54,7 @@ class Settings(BaseSettings):
     MAX_SCRAPER_RETRIES: int = Field(default=3, description="Màxim d'intents abans de bloqueig preventiu")
     SCRAPER_COOLDOWN_MINUTES: int = Field(default=60, description="Minuts de cooldown per evitar bloquejos de compte")
     BONPREU_PORTAL_URL: str = Field(default="https://www.bonpreuesclat.cat/energia")
-    DIGI_PORTAL_URL: str = Field(default="https://mi.digimobil.es/login")
+    DIGI_PORTAL_URL: str = Field(default="https://midigi.digimobil.es")
 
 
 settings = Settings()

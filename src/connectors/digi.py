@@ -47,7 +47,7 @@ class DigiConnector(BaseConnector):
         "clientes@digimobil.es",
     )
 
-    PORTAL_LOGIN_URL = "https://mi.digimobil.es/login"
+    PORTAL_LOGIN_URL = "https://midigi.digimobil.es"
 
     def is_enabled(self) -> bool:
         return settings.DIGI_ENABLED

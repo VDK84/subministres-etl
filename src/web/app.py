@@ -38,7 +38,7 @@ web_handler = WebLogHandler()
 web_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] (%(name)s) %(message)s", "%H:%M:%S"))
 logging.getLogger().addHandler(web_handler)
 
-app = FastAPI(title="Subministres ETL", version="0.2.0")
+app = FastAPI(title="Subministres ETL", version=settings.APP_VERSION)
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
