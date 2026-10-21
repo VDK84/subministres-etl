@@ -16,6 +16,7 @@ dist/
 .playwright/
 downloads/
 temp/
+tmp/
 
 # IDE & OS
 .vscode/

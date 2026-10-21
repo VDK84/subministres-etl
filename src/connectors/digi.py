@@ -2,6 +2,8 @@
 import logging
 import re
 from datetime import date
+from pathlib import Path
+from typing import Any
 
 try:
     from playwright.sync_api import Error as PlaywrightError
@@ -133,8 +135,12 @@ class DigiConnector(BaseConnector):
 
         return results
 
-    def fetch_invoices_from_portal(self, limit: int | None = 3) -> list[tuple[bytes, str]]:
-        """Autenticació al portal Mi Digi amb Playwright per descarregar les últimes factures."""
+    def fetch_invoices_from_portal(
+        self,
+        limit: int | None = 3,
+        otp_code: str | None = None,
+    ) -> list[tuple[bytes, str]]:
+        """Autenticació a Mi Digi amb Playwright, persistència de sessió i suport 2FA."""
         downloaded: list[tuple[bytes, str]] = []
         if self.is_in_cooldown():
             return downloaded
@@ -143,39 +149,96 @@ class DigiConnector(BaseConnector):
             self.logger.warning("Playwright no està instal·lat en aquest entorn.")
             return downloaded
 
+        session_dir = Path(settings.NAS_MOUNT_PATH) / ".sessions"
+        session_file = session_dir / "digi_session.json"
+        try:
+            session_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
         portal_url = settings.DIGI_PORTAL_URL
+        invoices_url = "https://midigi.digimobil.es/invoice"
+
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=settings.HEADLESS_BROWSER)
                 try:
-                    context = browser.new_context(accept_downloads=True)
+                    context_kwargs: dict[str, Any] = {"accept_downloads": True}
+                    if session_file.exists():
+                        self.logger.info("Carregant sessió prèvia de Mi Digi des del NAS...")
+                        context_kwargs["storage_state"] = str(session_file)
+
+                    context = browser.new_context(**context_kwargs)
                     page = context.new_page()
 
-                    self.logger.info(f"Obrint pàgina d'inici de sessió de Mi Digi: {portal_url}")
-                    page.goto(portal_url, timeout=settings.SCRAPER_TIMEOUT_MS)
-
-                    # Formulari d'inici de sessió Mi Digi (telèfon o email + password)
-                    page.fill(
-                        "input[name='username'], input[type='text'], input[type='email']", settings.DIGI_USER or ""
-                    )
-                    page.fill("input[type='password'], input[name='password']", settings.DIGI_PASSWORD or "")
-                    page.click("button[type='submit'], input[type='submit']")
-
+                    # 1. Intentem anar directament a la pàgina de factures
+                    self.logger.info(f"Obrint Mi Digi: {invoices_url}")
+                    page.goto(invoices_url, timeout=settings.SCRAPER_TIMEOUT_MS)
                     page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
 
-                    # Navegar a factures
-                    if "factura" not in page.url.lower():
-                        factura_link = page.query_selector("a[href*='factura'], button:has-text('Factura')")
-                        if factura_link:
-                            factura_link.click()
-                            page.wait_for_load_state("networkidle")
+                    # 2. Si ens redirigeix al login, la sessió no és vàlida i cal autenticar
+                    if "login" in page.url.lower():
+                        self.logger.info(f"Sessió no activa a Mi Digi. Anant a login: {portal_url}")
+                        page.goto(portal_url, timeout=settings.SCRAPER_TIMEOUT_MS)
+                        page.fill(
+                            "input[name='username'], input[type='text'], input[type='email']",
+                            settings.DIGI_USER or "",
+                        )
+                        page.fill("input[type='password'], input[name='password']", settings.DIGI_PASSWORD or "")
+                        page.click("button[type='submit'], input[type='submit']")
+                        page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
 
-                    # Cerca botons de descàrrega
+                        # 3. Detecció de 2FA (SMS / Codi de verificació)
+                        is_2fa = (
+                            "verif" in page.url.lower()
+                            or "security" in page.url.lower()
+                            or page.query_selector(
+                                "input[name*='code'], input[type='tel'], input[placeholder*='código']"
+                            )
+                            is not None
+                        )
+
+                        if is_2fa:
+                            if otp_code:
+                                self.logger.info(f"Aplicant codi 2FA proporcionat: {otp_code}")
+                                code_input = page.query_selector(
+                                    "input[name*='code'], input[type='tel'], input[type='text']"
+                                )
+                                if code_input:
+                                    code_input.fill(otp_code)
+                                    page.click(
+                                        "button[type='submit'], button:has-text('Verificar'), button:has-text('Continuar')"
+                                    )
+                                    page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+                            else:
+                                self.logger.warning(
+                                    "🔐 Mi Digi requereix codi 2FA (SMS/Email). "
+                                    "L'estat del connector queda com a 'Pendent de 2FA'. "
+                                    "Pots introduir el codi des de la web per validar la sessió."
+                                )
+                                try:
+                                    screenshot_path = session_dir / "digi_2fa_prompt.png"
+                                    page.screenshot(path=str(screenshot_path))
+                                except (OSError, RuntimeError):
+                                    pass
+                                return downloaded
+
+                    # 4. Si hem accedit a les factures amb èxit, desem la sessió al NAS
+                    if "invoice" in page.url.lower() or "factur" in page.url.lower():
+                        try:
+                            context.storage_state(path=str(session_file))
+                            self.logger.info("✅ Sessió de Mi Digi desada al NAS per a futures consultes!")
+                        except (OSError, RuntimeError):
+                            pass
+
+                    # 5. Cerca botons de descàrrega de factures (segons el DOM real de Mi DIGI.html)
                     download_buttons = page.query_selector_all(
-                        "a[href*='.pdf'], button:has-text('Descargar'), a:has-text('PDF')"
+                        "a[data-gtm-category='invoice'], a:has-text('Descargar'), button:has-text('Descargar'), a[href*='.pdf']"
                     )
-                    max_dl = limit or 3
-                    self.logger.info(f"Trobats {len(download_buttons)} enllaços de factura a Mi Digi (límit: {max_dl})")
+                    max_dl = limit or 6
+                    self.logger.info(
+                        f"Trobats {len(download_buttons)} enllaços de descàrrega de factura a Mi Digi (límit: {max_dl})"
+                    )
 
                     for i, btn in enumerate(download_buttons[:max_dl]):
                         try:
@@ -185,9 +248,11 @@ class DigiConnector(BaseConnector):
                             path = download.path()
                             if path:
                                 with open(path, "rb") as f:
-                                    downloaded.append((f.read(), download.suggested_filename or f"digi_{i}.pdf"))
+                                    downloaded.append(
+                                        (f.read(), download.suggested_filename or f"digi_factura_{i}.pdf")
+                                    )
                         except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError) as err:
-                            self.logger.warning(f"No s'ha pogut descarregar el botó {i}: {err}")
+                            self.logger.warning(f"No s'ha pogut descarregar la factura {i}: {err}")
 
                 except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as page_err:
                     self.record_failure(f"Error de navegació a Mi Digi: {page_err}")
