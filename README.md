@@ -121,7 +121,10 @@ Al repositori `argocd-bootstrap` es troba la declaració completa del servei:
   - `02-external-secret-app.yaml`: Credencials de l'aplicació des d'OpenBao.
   - `03-pv-samba-rw.yaml` & `04-pvc-samba-rw.yaml`: Volum persistent SMB (`//192.168.1.2/hdd2404/factures`).
   - `05-configmap.yaml`: Configuració no sensible de l'aplicació.
-  - `06-cronjob.yaml`: CronJob diari a les 06:00 UTC (`0 6 * * *`).
+  - `05-rbac.yaml`: `ServiceAccount`, `Role` i `RoleBinding` per a l'auto-anotació nativa del Pod en arrencar (`app.kubernetes.io/version`).
+  - `06-deployment.yaml`: Deployment del servidor web FastAPI + Uvicorn.
+  - `07-service.yaml` & `08-ingressroute.yaml`: Exposició interna i Ingress Traefik HTTPS a `https://subministres.rusc.local`.
+  - `09-cronjob.yaml`: CronJob diari a les 06:00 UTC (`0 6 * * *`).
 
 ### Execució Manual sota Demanda
 ```bash
@@ -137,11 +140,12 @@ L'aplicació incorpora una interfície web ultralleugera (FastAPI + HTMX + Tailw
 
 - **Sincronització sota demanda**: Botó "Sincronitzar Tot" o accions individuals per proveïdor (Veolia, Catgas, Bonpreu, Digi).
 - **⚡ Descàrrega ràpida de l'Última Factura (KISS)**: Botó "Última" a cada proveïdor per baixar únicament la darrera factura si no és al NAS, evitant duplicats tant a la base de dades com a l'emmagatzematge.
-- **📚 Explorador Històric & Descàrrega per Lots (Bulk Sync)**: Botó "Històric" que consulta totes les factures disponibles a la companyia (per bústia IMAP o portal web), les compara amb el NAS mostrant badges (`✅ Al NAS` vs `⏳ Pendent`) i ofereix el botó directe **"Descarregar Només Pendents"**.
+- **📚 Explorador Històric & Descàrrega per Lots (Bulk Sync)**: Botó "Històric" que consulta totes les factures disponibles a la companyia (per bústia IMAP o portal web), amb temporitzador visual en segons, mini-consola de logs en directe i botó directe **"Descarregar Només Pendents"**.
+- **📦 Pujada per Lots Multi-format (PDF, EML, ZIP)**: La zona de pujada manual (Dropzone) admet fitxers individuals en `.pdf` o `.eml`, i arxius **`.zip` complets** (amb desenes de PDFs o EMLs en subcarpetes). El sistema desempaqueta a memòria, detecta automàticament el proveïdor de cada factura i les classifica a les carpetes corresponents del NAS.
+- **🛡️ Filtre Estricte per Magic Bytes `%PDF`**: Protecció que descarta automàticament qualsevol imatge o logo inline (`.png`, `.jpg`, `.svg`) que les companyies adjunten als seus correus, garantint que només es processen documents de facturació reals.
 - **🔍 Control d'Accessibilitat i Mida de Lletra (A- / A+)**: Selector de mida de font amb persistència a `localStorage` (100% fins a 150%) dissenyat per a una lectura òptima en monitors grans de 32", 4K o dispositius mòbils.
-- **Pujada manual de factures (Dropzone / Drag & Drop)**: Permet arrossegar un PDF descarregat manualment; el sistema en detecta el proveïdor, n'extreu automàticament les dades, el guarda al NAS Samba i injecta les mètriques a InfluxDB.
-- **Explorador de Factures al NAS**: Taula interactiva amb cercador, botó de descàrrega directa i **visor de PDF integrat en finestra modal** sense haver de muntar la unitat SMB al dispositiu.
-- **Consola de Logs en directe**: Terminal integrada amb actualització automàtica cada 3 segons (polling HTMX) per seguir el progrés de l'scraping o detectar avisos de sessió.
+- **Explorador de Factures al NAS**: Taula interactiva amb cercador per text, **desplegable de filtratge per proveïdor**, **comptador dinàmic en viu** (*«Mostrant X de Y factures»*), descàrrega directa, visor de PDF integrat en finestra modal i **botó vermell 🗑️ Eliminar** (que suprimeix la factura del NAS Samba i n'elimina les mètriques d'InfluxDB de forma simultània).
+- **Consola de Logs en directe**: Terminal integrada amb actualització automàtica cada 3 segons (polling HTMX silenciós filtrat d'Uvicorn) per seguir el progrés de l'scraping o detectar avisos de sessió.
 
 ### Endpoints de l'API Web
 
@@ -152,7 +156,8 @@ L'aplicació incorpora una interfície web ultralleugera (FastAPI + HTMX + Tailw
 | `POST` | `/api/sync/latest` | Cerca i descarrega exclusivament l'última factura |
 | `GET` | `/api/history/{conn}` | Retorna el modal amb l'històric i comparativa amb el NAS |
 | `GET` | `/api/logs` | Fragment HTML amb els darrers logs per a polling HTMX |
-| `POST` | `/api/upload` | Pujada multipart d'un fitxer PDF i processament immediat |
+| `POST` | `/api/upload` | Pujada de fitxers (.pdf, .eml, .zip) amb detecció automàtica |
+| `DELETE` | `/api/invoice/{path}` | Elimina el PDF del NAS Samba i suprimeix les mètriques d'InfluxDB |
 | `GET` | `/api/pdf/view/{path}` | Serveix el fitxer PDF amb capçalera `inline` per al visor |
 | `GET` | `/api/pdf/download/{path}` | Descarrega el fitxer PDF directament |
 
