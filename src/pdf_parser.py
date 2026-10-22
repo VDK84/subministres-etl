@@ -23,17 +23,38 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     return "\n".join(text_parts)
 
 
+def normalize_amount_str(val_str: str) -> float | None:
+    """Normalitza una cadena numèrica monetària (ex: '25,00', '9.92', '1.234,56') a float de forma robusta."""
+    clean = val_str.strip()
+    if not clean:
+        return None
+    if "," in clean:
+        # Format europeu/espanyol estàndard: punts són milers, coma és decimal
+        clean = clean.replace(".", "").replace(",", ".")
+    elif "." in clean:
+        parts = clean.split(".")
+        if len(parts) == 2 and len(parts[1]) <= 2:
+            # Format float estàndard (ex: 9.92, 25.00): el punt és el separador decimal!
+            pass
+        elif len(parts) == 2 and len(parts[1]) == 3:
+            # Milers sense decimals (ex: 1.000)
+            clean = clean.replace(".", "")
+        else:
+            clean = clean.replace(".", "")
+
+    try:
+        return float(clean)
+    except ValueError:
+        return None
+
+
 def parse_euro_amount(text: str) -> float | None:
-    """Extreu el primer import en format monetari (ex: 45,67 € o 45.67€) i el converteix a float."""
+    """Extreu el primer import en format monetari (ex: 45,67 € o 9.92€) i el converteix a float."""
     match = re.search(r"(\d+(?:[.,]\d{1,2})?)\s*€", text)
     if not match:
         match = re.search(r"TOTAL[:\s]+(\d+(?:[.,]\d{1,2})?)", text, re.IGNORECASE)
     if match:
-        val_str = match.group(1).replace(".", "").replace(",", ".")
-        try:
-            return float(val_str)
-        except ValueError:
-            return None
+        return normalize_amount_str(match.group(1))
     return None
 
 
@@ -82,15 +103,11 @@ def extract_regex_first(text: str, pattern: str, group: int = 1) -> str | None:
 
 
 def extract_float_value(text: str, pattern: str, group: int = 1) -> float | None:
-    """Cerca un valor numèric amb regex i el converteix a float."""
+    """Cerca un valor numèric amb regex i el converteix a float de forma robusta."""
     val = extract_regex_first(text, pattern, group)
     if not val:
         return None
-    clean_val = val.replace(".", "").replace(",", ".") if "," in val else val
-    try:
-        return float(clean_val)
-    except ValueError:
-        return None
+    return normalize_amount_str(val)
 
 
 class PDFDataExtractor:

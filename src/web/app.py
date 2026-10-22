@@ -36,7 +36,7 @@ from src.connectors import (
 from src.email_client import decode_str, imap_client
 from src.influx_writer import influx_writer
 from src.models import FacturaMetriques, FacturaResult
-from src.pdf_parser import extract_text_from_pdf_bytes
+from src.pdf_parser import extract_text_from_pdf_bytes, parse_euro_amount
 from src.storage import storage
 
 # Logger i buffer circular per als logs de la interfície
@@ -231,6 +231,14 @@ def list_nas_invoices() -> list[dict[str, Any]]:
                     break
 
             import_val = amounts_map.get(num_clean) or amounts_map.get(pdf_path.stem.lower())
+            if import_val is None:
+                try:
+                    pdf_data = pdf_path.read_bytes()
+                    txt = extract_text_from_pdf_bytes(pdf_data)
+                    import_val = parse_euro_amount(txt)
+                except (OSError, RuntimeError, ValueError):
+                    pass
+
             if import_val is not None:
                 import_str = f"{import_val:.2f} €"
             else:
