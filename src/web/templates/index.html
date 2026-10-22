@@ -306,7 +306,7 @@
       </div>
     </div>
 
-    <!-- 4. Consola de Logs en Viu -->
+    <!-- 4. Consola de Logs en Viu (Nativa per WebSocket, Zero-Polling) -->
     <div class="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden">
       <div class="p-4 border-b border-slate-800 flex items-center justify-between">
         <h2 class="text-sm font-semibold text-white flex items-center gap-2">
@@ -314,25 +314,32 @@
           Consola d'Execució en Directe
         </h2>
         <div class="flex items-center gap-2">
-          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
-          <span class="text-[11px] text-slate-400 font-mono">Auto-refresh (3s)</span>
+          <span id="ws-status-dot" class="w-2 h-2 rounded-full bg-slate-500"></span>
+          <span id="ws-status-text" class="text-[11px] text-slate-400 font-mono">Connectant WebSocket...</span>
         </div>
       </div>
 
       <div 
         id="logs-container"
-        hx-get="/api/logs" 
-        hx-trigger="every 3s"
         class="p-4 bg-slate-950 font-mono text-xs overflow-y-auto max-h-64 space-y-1">
         {% for line in logs[-40:] %}
         <div class="text-gray-300 py-0.5">{{ line }}</div>
         {% else %}
-        <div class="text-gray-500 italic">Esperant primera execució...</div>
+        <div class="text-gray-500 italic">Esperant connexió...</div>
         {% endfor %}
       </div>
     </div>
 
   </main>
+
+  <!-- Banner Flotant de Nova Versió del Servidor -->
+  <div id="version-upgrade-banner" class="fixed bottom-6 right-6 z-50 hidden bg-emerald-950/95 border border-emerald-500/40 text-emerald-200 px-5 py-3.5 rounded-2xl shadow-2xl flex items-center gap-3 backdrop-blur">
+    <span class="relative flex h-3 w-3">
+      <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+      <span class="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+    </span>
+    <span id="version-upgrade-text" class="text-xs font-semibold">Actualitzant interfície...</span>
+  </div>
 
   <!-- Modal per previsualitzar PDF -->
   <div id="pdf-modal" class="fixed inset-0 z-50 hidden bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
@@ -587,7 +594,97 @@
           lucide.createIcons();
         }
       }
-    });
+    // -------------------------------------------------------------
+    // WebSocket per a Logs en Temps Real & Sincronització de Versió
+    // -------------------------------------------------------------
+    const CURRENT_VERSION = 'v{{ settings.APP_VERSION }}';
+    let logsSocket = null;
+    let wsReconnectTimeout = null;
+
+    function initWebSocketLogs() {
+      const dot = document.querySelector('#ws-status-dot');
+      const text = document.querySelector('#ws-status-text');
+      const container = document.querySelector('#logs-container');
+
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/ws/logs`;
+
+      try {
+        logsSocket = new WebSocket(wsUrl);
+
+        logsSocket.onopen = function() {
+          clearTimeout(wsReconnectTimeout);
+          if (dot) {
+            dot.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
+          }
+          if (text) {
+            text.textContent = 'En directe (WebSocket)';
+            text.className = 'text-[11px] text-emerald-400 font-mono';
+          }
+        };
+
+        logsSocket.onmessage = function(event) {
+          try {
+            const data = JSON.parse(event.data);
+
+            // 1. Sincronització de Versió del Servidor
+            if (data.type === 'version' && data.version) {
+              if (CURRENT_VERSION && data.version !== CURRENT_VERSION) {
+                console.log(`Versió del servidor (${data.version}) diferent de la pàgina (${CURRENT_VERSION}). Recarregant...`);
+                const banner = document.querySelector('#version-upgrade-banner');
+                const bannerText = document.querySelector('#version-upgrade-text');
+                if (banner && bannerText) {
+                  bannerText.textContent = `🎉 Nova versió del servidor detectada (${data.version}). Sincronitzant pàgina...`;
+                  banner.classList.remove('hidden');
+                }
+                setTimeout(() => {
+                  window.location.reload();
+                }, 1800);
+              }
+            }
+
+            // 2. Recepció de Logs en Viu
+            if (data.type === 'log' && data.line && container) {
+              const entry = document.createElement('div');
+              let color = 'text-gray-300';
+              if (data.line.includes('ERROR')) color = 'text-red-400 font-semibold';
+              else if (data.line.includes('WARNING')) color = 'text-yellow-300';
+              else if (data.line.includes('OK') || data.line.includes('correctament') || data.line.includes('desada')) color = 'text-emerald-400';
+
+              entry.className = `${color} py-0.5`;
+              entry.textContent = data.line;
+              container.appendChild(entry);
+              container.scrollTop = container.scrollHeight;
+            }
+          } catch (e) {
+            console.error('Error parsejant missatge WS:', e);
+          }
+        };
+
+        logsSocket.onclose = function() {
+          if (dot) {
+            dot.className = 'w-2 h-2 rounded-full bg-amber-500 animate-ping';
+          }
+          if (text) {
+            text.textContent = 'Reconnectant WebSocket...';
+            text.className = 'text-[11px] text-amber-400 font-mono';
+          }
+          // Intentar reconnectar cada 2.5 segons
+          clearTimeout(wsReconnectTimeout);
+          wsReconnectTimeout = setTimeout(initWebSocketLogs, 2500);
+        };
+
+        logsSocket.onerror = function() {
+          if (logsSocket) logsSocket.close();
+        };
+
+      } catch (err) {
+        console.error('No s\'ha pogut establir connexió WebSocket:', err);
+      }
+    }
+
+    // Inicialitzar el WebSocket al carregar la pàgina
+    initWebSocketLogs();
   </script>
 </body>
 </html>

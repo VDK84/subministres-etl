@@ -1,4 +1,5 @@
 # pyright: reportMissingImports=false
+import asyncio
 import email
 import io
 import logging
@@ -11,7 +12,17 @@ from typing import Annotated, Any
 
 import requests
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
 
@@ -32,12 +43,49 @@ from src.storage import storage
 logger = logging.getLogger("web_app")
 log_buffer: deque[str] = deque(maxlen=200)
 
+main_loop: asyncio.AbstractEventLoop | None = None
+
+
+class ConnectionManager:
+    """Gestiona les connexions WebSocket actives per emetre logs i notificacions de versió."""
+
+    def __init__(self) -> None:
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast_log(self, formatted_line: str) -> None:
+        for ws in list(self.active_connections):
+            try:
+                await ws.send_json({"type": "log", "line": formatted_line})
+            except (WebSocketDisconnect, ConnectionResetError, OSError):
+                self.disconnect(ws)
+
+    async def broadcast_version(self, version: str) -> None:
+        for ws in list(self.active_connections):
+            try:
+                await ws.send_json({"type": "version", "version": version})
+            except (WebSocketDisconnect, ConnectionResetError, OSError):
+                self.disconnect(ws)
+
+
+ws_manager = ConnectionManager()
+
 
 class WebLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
             log_buffer.append(msg)
+            # Emetre immediatament per WebSocket si hi ha un event loop i clients connectats
+            if main_loop and main_loop.is_running() and ws_manager.active_connections:
+                asyncio.run_coroutine_threadsafe(ws_manager.broadcast_log(msg), main_loop)
         except (TypeError, ValueError, RecursionError):
             return
 
@@ -102,6 +150,8 @@ def auto_annotate_k8s_pod() -> None:
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    global main_loop
+    main_loop = asyncio.get_running_loop()
     auto_annotate_k8s_pod()
 
 
@@ -285,6 +335,23 @@ async def trigger_sync(background_tasks: BackgroundTasks, connector: str = Form(
         f'<div class="p-4 mb-4 text-sm text-green-800 rounded-lg bg-green-50 dark:bg-gray-800 dark:text-green-400" role="alert">'
         f"🚀 Sincronització iniciada {target_desc} en segon pla. Els logs s'estan actualitzant a continuació.</div>"
     )
+
+
+@app.websocket("/ws/logs")
+async def websocket_logs_endpoint(websocket: WebSocket):
+    """Canal WebSocket bidireccional per transmetre logs en temps real i sincronització de versió."""
+    await ws_manager.connect(websocket)
+    try:
+        # 1. Enviar la versió actual del servidor per al version-check del frontend
+        await websocket.send_json({"type": "version", "version": f"v{settings.APP_VERSION}"})
+        # 2. Enviar els darrers logs acumulats per a la càrrega inicial
+        for line in list(log_buffer)[-40:]:
+            await websocket.send_json({"type": "log", "line": line})
+        while True:
+            # Manté la connexió oberta
+            await websocket.receive_text()
+    except (WebSocketDisconnect, ConnectionResetError, OSError):
+        ws_manager.disconnect(websocket)
 
 
 @app.get("/api/logs")
