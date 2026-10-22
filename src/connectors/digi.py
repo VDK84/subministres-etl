@@ -275,10 +275,12 @@ class DigiConnector(BaseConnector):
         if not text:
             return None
 
-        # 1. Número de factura (ex: Factura: 2026/DIGI/01234 o Número: FA26001234)
+        # 1. Número de factura (ex: FACTURA Número: DGFC2210546467)
         num_factura = extract_regex_first(
-            text, r"(?:Factura\s*n[úu]m\.?|N[úu]mero\s*de\s*factura:?)\s*([A-Za-z0-9/_-]+)"
+            text, r"(?:FACTURA\s+N[úu]mero|N[úu]mero\s*de\s*factura|Factura\s*n[úu]m\.?):\s*([A-Za-z0-9/_-]+)"
         )
+        if not num_factura:
+            num_factura = extract_regex_first(text, r"(DGFC\d{6,15})")
         if not num_factura:
             num_factura = extract_regex_first(text, r"Factura\s+([A-Za-z0-9/_-]{6,20})")
 
@@ -288,10 +290,14 @@ class DigiConnector(BaseConnector):
         )
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
 
-        # 3. Import total
+        # 3. Import total (prioritzant el total oficial de factura)
         total_eur = extract_float_value(
-            text, r"(?:Total\s*a\s*pagar|Total\s*factura|Import\s*total):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
+            text, r"(?:Total\s*a\s*pagar.*?|TOTAL\s*FACTURA.*?|Import\s*total.*?):\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
         )
+        if total_eur is None:
+            total_eur = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*€\s*TOTAL\s*FACTURA")
+        if total_eur is None:
+            total_eur = extract_float_value(text, r"TOTAL\s*SERVICIOS\s*(\d+(?:[.,]\d{1,2})?)\s*€?")
         if total_eur is None:
             total_eur = parse_euro_amount(text)
 
