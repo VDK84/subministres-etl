@@ -105,5 +105,34 @@ class InfluxMetricsWriter:
             logger.error(f"Error escrivint a InfluxDB: {e}")
             return False
 
+    def delete_factura_metrics(self, proveidor: str, numero_factura: str | None = None) -> bool:
+        """Elimina mètriques d'una factura a InfluxDB per evitar dades errònies a Grafana."""
+        if not self.is_configured():
+            return False
+
+        if settings.DRY_RUN:
+            logger.info(f"[DRY-RUN] S'eliminarien mètriques a InfluxDB per {proveidor} ({numero_factura})")
+            return True
+
+        predicate = f'_measurement="factures_subministres" and proveidor="{proveidor.lower()}"'
+        if numero_factura:
+            predicate += f' and numero_factura="{numero_factura}"'
+
+        try:
+            with InfluxDBClient(url=self.url, token=self.token, org=self.org) as client:
+                delete_api = client.delete_api()
+                delete_api.delete(
+                    start="1970-01-01T00:00:00Z",
+                    stop="2035-01-01T00:00:00Z",
+                    predicate=predicate,
+                    bucket=self.bucket,
+                    org=self.org,
+                )
+                logger.info(f"Mètriques eliminades a InfluxDB per {proveidor} ({numero_factura or 'totes'}).")
+                return True
+        except (InfluxDBError, urllib3.exceptions.HTTPError, OSError) as err:
+            logger.warning(f"Error eliminant mètriques d'InfluxDB: {err}")
+            return False
+
 
 influx_writer = InfluxMetricsWriter()

@@ -48,5 +48,17 @@ class StorageManager:
         logger.info(f"Factura desada correctament a: {target_path}")
         return target_path
 
+    def delete_pdf(self, rel_path: str) -> bool:
+        """Elimina un fitxer del NAS Samba de forma segura."""
+        target = (self.base_path / rel_path).resolve()
+        if not str(target).startswith(str(self.base_path.resolve())) or not target.exists():
+            return False
+        if settings.DRY_RUN:
+            logger.info(f"[DRY-RUN] S'eliminaria el fitxer a: {target}")
+            return True
+        target.unlink(missing_ok=True)
+        logger.info(f"Fitxer eliminat correctament del NAS: {target}")
+        return True
+
 
 storage = StorageManager()

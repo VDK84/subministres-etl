@@ -23,8 +23,10 @@ from src.connectors import (
     VeoliaConnector,
 )
 from src.email_client import decode_str, imap_client
+from src.influx_writer import influx_writer
 from src.models import FacturaMetriques, FacturaResult
 from src.pdf_parser import extract_text_from_pdf_bytes
+from src.storage import storage
 
 # Logger i buffer circular per als logs de la interfície
 logger = logging.getLogger("web_app")
@@ -617,6 +619,34 @@ async def download_pdf(rel_path: str):
         media_type="application/pdf",
         filename=full_path.name,
     )
+
+
+@app.delete("/api/invoice/{rel_path:path}")
+async def delete_invoice(rel_path: str):
+    """Elimina una factura del NAS Samba i suprimeix les mètriques d'InfluxDB per evitar dades errònies a Grafana."""
+    parts = Path(rel_path).parts
+    proveidor = parts[1] if len(parts) > 1 else ""
+    filename = Path(rel_path).name
+
+    # Deduïm el número de factura
+    numero_factura = filename.replace(".pdf", "").replace(".PDF", "")
+    for p in ["bonpreu", "digi", "veolia", "catgas"]:
+        if f"_{p}_" in numero_factura.lower():
+            numero_factura = numero_factura.lower().split(f"_{p}_", 1)[1]
+            break
+
+    # 1. Eliminar del NAS
+    deleted_nas = storage.delete_pdf(rel_path)
+
+    # 2. Eliminar d'InfluxDB
+    deleted_influx = False
+    if proveidor:
+        deleted_influx = influx_writer.delete_factura_metrics(proveidor, numero_factura)
+
+    logger.info(
+        f"Factura '{rel_path}' eliminada: NAS={deleted_nas}, InfluxDB={deleted_influx} (Proveïdor: {proveidor}, Factura: {numero_factura})"
+    )
+    return HTMLResponse(content="", status_code=200)
 
 
 def start() -> None:
