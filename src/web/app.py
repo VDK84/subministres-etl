@@ -174,13 +174,31 @@ def get_all_connectors_map():
     }
 
 
+MESOS_CATALANS = {
+    "01": "Gen",
+    "02": "Feb",
+    "03": "Mar",
+    "04": "Abr",
+    "05": "Mai",
+    "06": "Jun",
+    "07": "Jul",
+    "08": "Ago",
+    "09": "Set",
+    "10": "Oct",
+    "11": "Nov",
+    "12": "Des",
+}
+
+
 def list_nas_invoices() -> list[dict[str, Any]]:
-    """Explora el directori del NAS Samba per llistar totes les factures existents."""
+    """Explora el directori del NAS Samba per llistar totes les factures existents amb mes i import."""
     root = Path(settings.NAS_MOUNT_PATH)
     if not root.exists():
         return []
 
+    amounts_map = influx_writer.get_factures_amounts()
     invoices: list[dict[str, Any]] = []
+
     for pdf_path in root.glob("**/*.pdf"):
         try:
             stat = pdf_path.stat()
@@ -190,12 +208,45 @@ def list_nas_invoices() -> list[dict[str, Any]]:
             proveidor = parts[1] if len(parts) > 1 else "desconegut"
             any_str = parts[2] if len(parts) > 2 else ""
 
+            # 1. Deducció del Mes (ex: 2026_10_catgas_FG26086862 -> 10)
+            fn_parts = pdf_path.stem.split("_")
+            mes_code = "01"
+            if len(fn_parts) >= 2 and fn_parts[1].isdigit():
+                mes_code = fn_parts[1].zfill(2)
+            elif len(fn_parts) >= 2 and "-" in fn_parts[1]:
+                # Si és bimensual/trimestral (ex: 09-10), agafem el primer mes del rang
+                sub_p = fn_parts[1].split("-")
+                if sub_p[0].isdigit():
+                    mes_code = sub_p[0].zfill(2)
+            else:
+                mes_code = datetime.fromtimestamp(stat.st_mtime).strftime("%m")
+
+            mes_label = f"{MESOS_CATALANS.get(mes_code, mes_code)} ({mes_code})"
+
+            # 2. Deducció de l'Import
+            num_clean = pdf_path.stem.lower()
+            for p in ["catgas", "veolia", "bonpreu", "digi"]:
+                if f"_{p}_" in num_clean:
+                    num_clean = num_clean.split(f"_{p}_", 1)[1]
+                    break
+
+            import_val = amounts_map.get(num_clean) or amounts_map.get(pdf_path.stem.lower())
+            if import_val is not None:
+                import_str = f"{import_val:.2f} €"
+            else:
+                import_str = "- €"
+                import_val = 0.0
+
             invoices.append(
                 {
                     "filename": pdf_path.name,
                     "tipus": tipus,
                     "proveidor": proveidor,
                     "any": any_str,
+                    "mes": mes_code,
+                    "mes_label": mes_label,
+                    "import_val": import_val,
+                    "import_str": import_str,
                     "size_kb": round(stat.st_size / 1024, 1),
                     "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
                     "rel_path": str(rel_path).replace("\\", "/"),

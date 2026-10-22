@@ -26,6 +26,7 @@
         }
       }
     }
+  </script>
   <!-- Script per carregar la mida de font abans del render (evita parpelleig) -->
   <script>
     (function() {
@@ -249,14 +250,16 @@
 
       <div class="overflow-x-auto max-h-[360px] overflow-y-auto">
         <table class="w-full text-left text-xs text-slate-300" id="invoices-table">
-          <thead class="bg-slate-950/80 text-slate-400 uppercase text-[10px] tracking-wider sticky top-0">
+          <thead class="bg-slate-950/80 text-slate-400 uppercase text-[10px] tracking-wider sticky top-0 select-none">
             <tr>
-              <th class="py-3 px-4">Proveïdor</th>
-              <th class="py-3 px-4">Tipus</th>
-              <th class="py-3 px-4">Any</th>
-              <th class="py-3 px-4">Nom Fitxer</th>
-              <th class="py-3 px-4">Mida</th>
-              <th class="py-3 px-4">Data Fitxer</th>
+              <th onclick="sortTable(0)" class="py-3 px-4 cursor-pointer hover:text-white transition">Proveïdor <span class="sort-icon text-[9px] text-slate-500">↕</span></th>
+              <th onclick="sortTable(1)" class="py-3 px-4 cursor-pointer hover:text-white transition">Tipus <span class="sort-icon text-[9px] text-slate-500">↕</span></th>
+              <th onclick="sortTable(2)" class="py-3 px-4 cursor-pointer hover:text-white transition">Any <span class="sort-icon text-[9px] text-slate-500">↕</span></th>
+              <th onclick="sortTable(3)" class="py-3 px-4 cursor-pointer hover:text-white transition">Mes <span class="sort-icon text-[9px] text-slate-500">↕</span></th>
+              <th onclick="sortTable(4)" class="py-3 px-4 cursor-pointer hover:text-white transition text-right">Import <span class="sort-icon text-[9px] text-slate-500">↕</span></th>
+              <th onclick="sortTable(5)" class="py-3 px-4 cursor-pointer hover:text-white transition">Nom Fitxer <span class="sort-icon text-[9px] text-slate-500">↕</span></th>
+              <th onclick="sortTable(6)" class="py-3 px-4 cursor-pointer hover:text-white transition">Mida <span class="sort-icon text-[9px] text-slate-500">↕</span></th>
+              <th onclick="sortTable(7)" class="py-3 px-4 cursor-pointer hover:text-white transition">Data Fitxer <span class="sort-icon text-[9px] text-slate-500">↕</span></th>
               <th class="py-3 px-4 text-right">Accions</th>
             </tr>
           </thead>
@@ -265,7 +268,9 @@
             <tr class="hover:bg-slate-800/40 transition invoice-row">
               <td class="py-3 px-4 font-semibold text-white uppercase">{{ inv.proveidor }}</td>
               <td class="py-3 px-4 text-slate-400">{{ inv.tipus }}</td>
-              <td class="py-3 px-4 text-emerald-400">{{ inv.any }}</td>
+              <td class="py-3 px-4 text-emerald-400 font-bold">{{ inv.any }}</td>
+              <td class="py-3 px-4 text-slate-300">{{ inv.mes_label }}</td>
+              <td class="py-3 px-4 font-semibold text-emerald-400 text-right">{{ inv.import_str }}</td>
               <td class="py-3 px-4 font-normal text-slate-200 truncate max-w-xs" title="{{ inv.filename }}">{{ inv.filename }}</td>
               <td class="py-3 px-4 text-slate-400">{{ inv.size_kb }} KB</td>
               <td class="py-3 px-4 text-slate-400">{{ inv.modified }}</td>
@@ -557,6 +562,53 @@
       if (countElem) {
         countElem.textContent = visibleCount;
       }
+    }
+
+    // -------------------------------------------------------------
+    // Ordenació interactiva de la taula (ASC / DESC)
+    // -------------------------------------------------------------
+    const sortStates = {};
+
+    function sortTable(columnIndex) {
+      const table = document.querySelector("#invoices-table");
+      if (!table) return;
+      const tbody = table.querySelector("tbody");
+      if (!tbody) return;
+      const rows = Array.from(tbody.querySelectorAll("tr.invoice-row"));
+      if (rows.length === 0) return;
+
+      const isAsc = sortStates[columnIndex] !== 'asc';
+      sortStates[columnIndex] = isAsc ? 'asc' : 'desc';
+
+      // Actualitzar icones de tots els headers
+      table.querySelectorAll(".sort-icon").forEach((el, idx) => {
+        if (idx === columnIndex) {
+          el.textContent = isAsc ? '▲' : '▼';
+          el.className = 'sort-icon text-[9px] text-emerald-400 font-bold';
+        } else {
+          el.textContent = '↕';
+          el.className = 'sort-icon text-[9px] text-slate-500';
+        }
+      });
+
+      rows.sort((a, b) => {
+        const valA = a.children[columnIndex]?.textContent?.trim() || '';
+        const valB = b.children[columnIndex]?.textContent?.trim() || '';
+
+        // Comprovar si són imports o mides numèriques (ex: 70.57 € o 361.3 KB)
+        const cleanA = valA.replace('€', '').replace('KB', '').trim();
+        const cleanB = valB.replace('€', '').replace('KB', '').trim();
+        const numA = parseFloat(cleanA);
+        const numB = parseFloat(cleanB);
+
+        if (!isNaN(numA) && !isNaN(numB) && cleanA.length > 0 && cleanB.length > 0 && !isNaN(cleanA.charAt(0)) && !isNaN(cleanB.charAt(0))) {
+          return isAsc ? numA - numB : numB - numA;
+        }
+
+        return isAsc ? valA.localeCompare(valB) : valB.localeCompare(valA);
+      });
+
+      rows.forEach(r => tbody.appendChild(r));
     }
 
     // Netejar temporitzador quan HTMX carrega la resposta

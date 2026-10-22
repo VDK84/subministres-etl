@@ -1,7 +1,10 @@
 # pyright: reportMissingImports=false
+import csv
+import io
 import logging
 from datetime import UTC, datetime, time
 
+import requests
 import urllib3.exceptions
 from influxdb_client.client.exceptions import InfluxDBError
 from influxdb_client.client.influxdb_client import InfluxDBClient
@@ -133,6 +136,39 @@ class InfluxMetricsWriter:
         except (InfluxDBError, urllib3.exceptions.HTTPError, OSError) as err:
             logger.warning(f"Error eliminant mètriques d'InfluxDB: {err}")
             return False
+
+    def get_factures_amounts(self) -> dict[str, float]:
+        """Recupera un mapa {numero_factura: import_total} d'InfluxDB mitjançant l'API REST."""
+        if not self.is_configured():
+            return {}
+
+        url = f"{self.url}/api/v2/query?org={self.org}"
+        headers = {
+            "Authorization": f"Token {self.token}",
+            "Content-Type": "application/vnd.flux",
+            "Accept": "application/csv",
+        }
+        flux_body = (
+            f'from(bucket: "{self.bucket}") '
+            "|> range(start: -10y) "
+            '|> filter(fn: (r) => r["_measurement"] == "factures_subministres" and r["_field"] == "import_total")'
+        )
+        result_map: dict[str, float] = {}
+        try:
+            resp = requests.post(url, headers=headers, data=flux_body, timeout=4)
+            if resp.status_code == 200:
+                reader = csv.DictReader(io.StringIO(resp.text))
+                for row in reader:
+                    num = row.get("numero_factura")
+                    val_str = row.get("_value")
+                    if num and val_str:
+                        try:
+                            result_map[str(num).strip().lower()] = float(val_str)
+                        except ValueError:
+                            continue
+        except (OSError, requests.exceptions.RequestException) as err:
+            logger.debug(f"No s'ha pogut obtenir mapa d'imports d'InfluxDB via REST: {err}")
+        return result_map
 
 
 influx_writer = InfluxMetricsWriter()
