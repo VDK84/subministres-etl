@@ -5,10 +5,10 @@ Aquest document conté les instruccions detallades, correccions de *bugs*, millo
 > **Instruccions per a l'Agent:** Aplica les tasques següents en ordre. Verifica que tots els tests o comprovacions de tipus (`ruff`, `pyright`) continuïn passant després de cada bloc de canvis.
 
 ### 📊 Estat d'Execució
-- **🔴 BLOC 1 (Bugs Lògics i Connectors):** ✅ Aplicat i verificat
-- **🛡️ BLOC 2 (Seguretat, XSS, Path Traversal & 50MB Limit):** ✅ Aplicat i verificat
-- **⚡ BLOC 3 (Asincronia, Event Loop & IMAP Headers):** ⏳ Pendent
-- **🧹 BLOC 4 (Lifespan, Neteja de Dependències & Helm CronJob):** ⏳ Pendent
+- **🔴 BLOC 1 (Bugs Lògics i Connectors):** ✅ Aplicat i verificat (v0.14.0)
+- **🛡️ BLOC 2 (Seguretat, XSS, Path Traversal & 50MB Limit):** ✅ Aplicat i verificat (v0.14.0)
+- **⚡ BLOC 3 (Asincronia, Event Loop & IMAP Headers):** ✅ Aplicat i verificat (v0.15.0)
+- **🧹 BLOC 4 (Lifespan, Neteja de Dependències & Helm CronJob):** ✅ Aplicat i verificat (v0.15.0)
 
 ---
 
@@ -188,7 +188,7 @@ for zinfo in z.infolist():
 
 ---
 
-## ⚡ BLOC 3: Optimització de Rendiment i Asincronia
+## ⚡ BLOC 3: Optimització de Rendiment i Asincronia (✅ Aplicat)
 
 ### 3.1. Desbloquejar l'Event Loop de FastAPI
 * **Fitxer afectat:** `src/web/app.py`
@@ -244,7 +244,7 @@ async def get_connector_history(connector: str):
 
 ---
 
-## 🧹 BLOC 4: Neteja de Codi, Dependències i Infraestructura
+## 🧹 BLOC 4: Neteja de Codi, Dependències i Infraestructura (✅ Aplicat)
 
 ### 4.1. Migrar `@app.on_event("startup")` a `lifespan`
 * **Fitxer afectat:** `src/web/app.py`

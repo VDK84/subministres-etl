@@ -86,6 +86,20 @@ class ImapMailboxClient:
                 logger.info(f"Trobats {len(mail_ids)} correus des de {since_date} a {self.folder}")
 
                 for mail_id in mail_ids:
+                    # 1. Optimització: descarregar només capçaleres per filtrar ràpidament
+                    if sender_filters:
+                        _, hdr_data = client.fetch(mail_id, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
+                        if hdr_data and hdr_data[0] and isinstance(hdr_data[0][1], bytes):
+                            hdr_msg = email.message_from_bytes(hdr_data[0][1])
+                            h_sender = decode_str(hdr_msg.get("From", "")).lower()
+                            h_subject = decode_str(hdr_msg.get("Subject", "")).lower()
+                            matches_hdr_sender = any(f.lower() in h_sender for f in sender_filters)
+                            matches_hdr_subject = any(f.lower() in h_subject for f in sender_filters)
+                            is_fwd_or_eml = "fwd:" in h_subject or "reenviat:" in h_subject or "factur" in h_subject
+                            if not matches_hdr_sender and not matches_hdr_subject and not is_fwd_or_eml:
+                                continue
+
+                    # 2. Descarregar el correu complet només dels correus candidats
                     _, msg_data = client.fetch(mail_id, "(RFC822)")
                     if not msg_data or not msg_data[0]:
                         continue

@@ -8,6 +8,7 @@ import os
 import re
 import zipfile
 from collections import deque
+from contextlib import asynccontextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated, Any
@@ -105,7 +106,16 @@ class EndpointFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
-app = FastAPI(title="Subministres ETL", version=settings.APP_VERSION)
+
+@asynccontextmanager
+async def lifespan(fastapi_app: FastAPI):
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+    await asyncio.to_thread(auto_annotate_k8s_pod)
+    yield
+
+
+app = FastAPI(title="Subministres ETL", version=settings.APP_VERSION, lifespan=lifespan)
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -148,13 +158,6 @@ def auto_annotate_k8s_pod() -> None:
             logger.warning(f"No s'ha pogut auto-anotar el Pod (HTTP {resp.status_code}): {resp.text}")
     except (OSError, RuntimeError, requests.exceptions.RequestException) as err:
         logger.warning(f"Error intentant auto-anotar el Pod a Kubernetes: {err}")
-
-
-@app.on_event("startup")
-async def startup_event() -> None:
-    global main_loop
-    main_loop = asyncio.get_running_loop()
-    auto_annotate_k8s_pod()
 
 
 # Estat d'execució global
@@ -316,7 +319,7 @@ def run_sync_task(
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Pàgina principal amb dashboard operatiu i controls."""
-    invoices = list_nas_invoices()
+    invoices = await asyncio.to_thread(list_nas_invoices)
 
     # Calcular darrera factura per proveïdor
     last_by_provider: dict[str, str] = {}
@@ -470,13 +473,13 @@ async def trigger_sync_latest(
 
 @app.get("/api/history/{connector}")
 async def get_connector_history(connector: str):
-    """Consulta les factures històriques disponibles i en retorna el fragment per al modal."""
+    """Consulta les factures històriques disponibles sense bloquejar l'event loop."""
     connectors = get_all_connectors_map()
     conn = connectors.get(connector.lower())
     if not conn:
         raise HTTPException(status_code=404, detail=f"Proveïdor '{connector}' desconegut.")
 
-    invoices = conn.fetch_available_invoices(imap_client)
+    invoices = await asyncio.to_thread(conn.fetch_available_invoices, imap_client)
     pendents = [inv for inv in invoices if not inv.get("exists_in_nas", False)]
 
     # Renderitzem el fragment HTML per al modal
