@@ -381,3 +381,40 @@ class BonpreuConnector(BaseConnector):
             potencia_contractada_kw=potencia,
             cups_o_referencia=cups,
         )
+
+    def fetch_available_invoices(self, imap_client: ImapMailboxClient) -> list[dict]:
+        """Llista les factures de Bonpreu trobades per avisos de correu i al NAS."""
+        invoices: list[dict] = []
+        if not self.is_enabled():
+            return invoices
+
+        from src.storage import storage
+
+        emails = imap_client.fetch_recent_emails(sender_filters=list(self.EMAIL_SENDERS), days_back=730)
+        emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
+
+        for em in emails:
+            d_str = em.date.strftime("%Y-%m-%d") if em.date else "Data desconeguda"
+            any_str = str(em.date.year) if em.date else str(date.today().year)
+            mes_str = f"{em.date.month:02d}" if em.date else "01"
+            parsed_amt = parse_euro_amount(em.body_text) or parse_euro_amount(em.subject) or 0.0
+
+            dest_dir = storage.get_destination_dir(self.tipus.value, self.name, any_str)
+            existing_pdfs = list(dest_dir.glob(f"{any_str}_{mes_str}_{self.name}_*.pdf"))
+            ja_al_nas = len(existing_pdfs) > 0
+
+            inv_num = existing_pdfs[0].stem.split(f"_{self.name}_")[-1] if ja_al_nas else f"AVIS-{any_str}{mes_str}"
+
+            invoices.append(
+                {
+                    "id": f"{em.msg_id}_bonpreu_{any_str}_{mes_str}",
+                    "proveidor": self.name,
+                    "tipus": self.tipus.value,
+                    "data": d_str,
+                    "numero": inv_num,
+                    "import": parsed_amt,
+                    "subject": em.subject,
+                    "exists_in_nas": ja_al_nas,
+                }
+            )
+        return invoices

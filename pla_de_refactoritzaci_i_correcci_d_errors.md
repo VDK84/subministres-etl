@@ -294,3 +294,26 @@ app = FastAPI(title="Subministres ETL", version=settings.APP_VERSION, lifespan=l
                 {{- toYaml .Values.args | nindent 16 }}
               {{- end }}
 ```
+
+---
+
+## 💎 BLOC 5: Poliment d'Auditoria, Coherència d'Històric i Seguretat (✅ Aplicat a v0.16.0)
+
+1. **Sincronització Històrica Real (`mode="all"`):**
+   * Endpoint `/api/sync` actualitzat per rebre `mode: str = Form(default="normal")` i propagar-lo a `run_sync_task`.
+   * Formulari d'històric enviant `<input type="hidden" name="mode" value="all">` i embolcallant els checkboxes de la taula.
+2. **Coherència en la Detecció de Factures Existents al NAS:**
+   * `CatgasConnector` i `VeoliaConnector` extreuen les mètriques reals del PDF a memòria amb `extract_metrics_from_pdf` per construir exactament el mateix patró de nom de fitxer que utilitza `save_and_ingest()`.
+   * Ja no es basen en `att.filename` ni en dates de correu imprecises.
+3. **Suport d'Històric per a Bonpreu i Digi:**
+   * Implementat `fetch_available_invoices` a `BonpreuConnector` i `DigiConnector` per consultar tant avisos com factures existents al NAS.
+4. **Prevenció XSS i Neteja a Endpoints:**
+   * Escapat estricte amb `html.escape()` per a `target_desc`, `desc` i les línies de text a `/api/logs`.
+5. **Memòria Cau en Memòria per a Lectura de Factures (`_pdf_amount_cache`):**
+   * S'evita rellegir i parsejar desenes de PDFs des de Samba a cada F5 guardant `(st_mtime, amount)` a memòria.
+   * `extract_text_from_pdf_bytes` retorna `""` buit en cas d'error en comptes del text d'excepció.
+6. **Hardening Docker, Colspan i Alineació SemVer:**
+   * Eliminats compiladors `gcc`, `libffi-dev`, `libssl-dev` després del pip install.
+   * Creat i assignat usuari no-root `appuser` (UID 1000).
+   * Corregit `colspan="9"` a la taula buida d'`index.html`.
+   * Alineades les versions a `0.15.0` / `0.16.0` a `Dockerfile`, `config.py`, `pyproject.toml`, `Chart.yaml` i `src/__init__.py`.

@@ -1,5 +1,6 @@
 # pyright: reportMissingImports=false
 import io
+import logging
 import re
 from datetime import date
 from typing import Any
@@ -7,6 +8,8 @@ from typing import Any
 from dateutil import parser as date_parser
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
+
+logger = logging.getLogger("pdf_parser")
 
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
@@ -19,7 +22,8 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
             if extracted:
                 text_parts.append(extracted)
     except (PdfReadError, OSError, ValueError) as e:
-        text_parts.append(f"Error extracting text: {e}")
+        logger.warning(f"Error extreient text del PDF: {e}")
+        return ""
     return "\n".join(text_parts)
 
 

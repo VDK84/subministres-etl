@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = Field(default="INFO")
     DRY_RUN: bool = Field(default=False)
     DAYS_BACK: int = Field(default=60, description="Dies enrere per buscar correus o factures")
-    APP_VERSION: str = Field(default="0.3.3", description="Versió de l'aplicació")
+    APP_VERSION: str = Field(default="0.15.0", description="Versió de l'aplicació")
 
     # Storage NAS Samba (Mount point al contenidor K8s)
     NAS_MOUNT_PATH: str = Field(default="/data/factures", description="Punt de muntatge del share Samba al contenidor")

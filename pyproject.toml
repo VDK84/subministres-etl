@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "subministres-etl"
-version = "0.3.3"
+version = "0.15.0"
 description = "ETL i interfície web de gestió de factures de subministraments (Aigua, Gas, Llum, Telefonia) per desar a NAS i InfluxDB"
 authors = [{ name = "VDK84" }]
 readme = "README.md"

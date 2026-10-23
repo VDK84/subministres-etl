@@ -198,6 +198,10 @@ MESOS_CATALANS = {
 }
 
 
+# Memòria cau per no re-parsejar els PDFs del NAS a cada recàrrega de pàgina
+_pdf_amount_cache: dict[str, tuple[float, float]] = {}  # rel_path -> (mtime, amount)
+
+
 def list_nas_invoices() -> list[dict[str, Any]]:
     """Explora el directori del NAS Samba per llistar totes les factures existents amb mes i import."""
     root = Path(settings.NAS_MOUNT_PATH)
@@ -240,12 +244,18 @@ def list_nas_invoices() -> list[dict[str, Any]]:
 
             import_val = amounts_map.get(num_clean) or amounts_map.get(pdf_path.stem.lower())
             if import_val is None:
-                try:
-                    pdf_data = pdf_path.read_bytes()
-                    txt = extract_text_from_pdf_bytes(pdf_data)
-                    import_val = parse_euro_amount(txt)
-                except (OSError, RuntimeError, ValueError):
-                    pass
+                cached = _pdf_amount_cache.get(str(rel_path))
+                if cached and cached[0] == stat.st_mtime:
+                    import_val = cached[1]
+                else:
+                    try:
+                        pdf_data = pdf_path.read_bytes()
+                        txt = extract_text_from_pdf_bytes(pdf_data)
+                        import_val = parse_euro_amount(txt)
+                        if import_val is not None:
+                            _pdf_amount_cache[str(rel_path)] = (stat.st_mtime, import_val)
+                    except (OSError, RuntimeError, ValueError):
+                        pass
 
             if import_val is not None:
                 import_str = f"{import_val:.2f} €"
@@ -386,7 +396,11 @@ async def index(request: Request):
 
 
 @app.post("/api/sync")
-async def trigger_sync(background_tasks: BackgroundTasks, connector: str = Form(default="")):
+async def trigger_sync(
+    background_tasks: BackgroundTasks,
+    connector: str = Form(default=""),
+    mode: str = Form(default="normal"),
+):
     """Dispara la sincronització en segon pla."""
     if execution_state["is_running"]:
         return HTMLResponse(
@@ -395,12 +409,15 @@ async def trigger_sync(background_tasks: BackgroundTasks, connector: str = Form(
         )
 
     target = connector.strip() if connector else None
-    background_tasks.add_task(run_sync_task, target)
+    sync_mode = mode.strip() if mode else "normal"
+    background_tasks.add_task(run_sync_task, target, mode=sync_mode)
 
-    target_desc = f"del proveïdor {target.upper()}" if target else "de tots els proveïdors"
+    target_escaped = html.escape(target.upper()) if target else None
+    target_desc = f"del proveïdor {target_escaped}" if target_escaped else "de tots els proveïdors"
+    mode_desc = "històrica completa (730 dies)" if sync_mode == "all" else "ordinària"
     return HTMLResponse(
         f'<div class="p-4 mb-4 text-sm text-green-800 rounded-lg bg-green-50 dark:bg-gray-800 dark:text-green-400" role="alert">'
-        f"🚀 Sincronització iniciada {target_desc} en segon pla. Els logs s'estan actualitzant a continuació.</div>"
+        f"🚀 Sincronització {mode_desc} iniciada {target_desc} en segon pla. Els logs s'estan actualitzant a continuació.</div>"
     )
 
 
@@ -437,7 +454,7 @@ async def get_logs_fragment():
             color = "text-yellow-300"
         elif "OK" in line or "correctament" in line or "desada" in line:
             color = "text-emerald-400"
-        html_lines.append(f'<div class="{color} py-0.5">{line}</div>')
+        html_lines.append(f'<div class="{color} py-0.5">{html.escape(line)}</div>')
 
     is_running_badge = ""
     if execution_state["is_running"]:
@@ -464,7 +481,12 @@ async def trigger_sync_latest(
     target = connector.strip() if connector else None
     background_tasks.add_task(run_sync_task, target, mode="latest", limit=1)
 
-    desc = f"de l'última factura de {target.upper()}" if target else "de les últimes factures de tots els proveïdors"
+    target_escaped = html.escape(target.upper()) if target else None
+    desc = (
+        f"de l'última factura de {target_escaped}"
+        if target_escaped
+        else "de les últimes factures de tots els proveïdors"
+    )
     return HTMLResponse(
         f'<div class="p-4 mb-4 text-sm text-emerald-800 rounded-lg bg-emerald-50 dark:bg-gray-800 dark:text-emerald-400">'
         f"⚡ Cerca ràpida iniciada {desc}. Si ja és al NAS, no es duplicarà.</div>"
@@ -531,39 +553,41 @@ async def get_connector_history(connector: str):
         </button>
       </div>
 
-      <!-- Accions ràpides KISS -->
-      <div class="flex flex-wrap items-center justify-between gap-3 bg-slate-950/60 p-3 rounded-xl border border-slate-800">
-        <div class="flex items-center gap-2 text-xs">
-          <button type="button" onclick="toggleAllCheckboxes(true)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700">Seleccionar Tot</button>
-          <button type="button" onclick="toggleAllCheckboxes(false)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700">Deseleccionar</button>
-          <button type="button" onclick="selectOnlyPending()" class="px-2.5 py-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 rounded-lg border border-amber-500/30">Només Pendents</button>
-        </div>
+      <form id="history-sync-form" hx-post="/api/sync" hx-target="#notification-area" onsubmit="closeHistoryModal()" class="space-y-4">
+        <input type="hidden" name="connector" value="{conn.name}">
+        <input type="hidden" name="mode" value="all">
 
-        <form hx-post="/api/sync" hx-target="#notification-area" onclick="closeHistoryModal()" class="flex items-center gap-2">
-          <input type="hidden" name="connector" value="{conn.name}">
+        <!-- Accions ràpides KISS -->
+        <div class="flex flex-wrap items-center justify-between gap-3 bg-slate-950/60 p-3 rounded-xl border border-slate-800">
+          <div class="flex items-center gap-2 text-xs">
+            <button type="button" onclick="toggleAllCheckboxes(true)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700">Seleccionar Tot</button>
+            <button type="button" onclick="toggleAllCheckboxes(false)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700">Deseleccionar</button>
+            <button type="button" onclick="selectOnlyPending()" class="px-2.5 py-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 rounded-lg border border-amber-500/30">Només Pendents</button>
+          </div>
+
           <button type="submit" class="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-lg shadow transition flex items-center gap-1.5">
             <span>📥 Sincronitzar Tot l'Històric</span>
           </button>
-        </form>
-      </div>
+        </div>
 
-      <!-- Taula de factures -->
-      <div class="max-h-72 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/40">
-        <table class="w-full text-left border-collapse">
-          <thead class="sticky top-0 bg-slate-900 border-b border-slate-800 text-[11px] text-slate-400 uppercase tracking-wider">
-            <tr>
-              <th class="py-2.5 px-3 w-8"></th>
-              <th class="py-2.5 px-3">Data</th>
-              <th class="py-2.5 px-3">Factura</th>
-              <th class="py-2.5 px-3 text-right">Import</th>
-              <th class="py-2.5 px-3 text-center">Estat al NAS</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows_html}
-          </tbody>
-        </table>
-      </div>
+        <!-- Taula de factures -->
+        <div class="max-h-72 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/40">
+          <table class="w-full text-left border-collapse">
+            <thead class="sticky top-0 bg-slate-900 border-b border-slate-800 text-[11px] text-slate-400 uppercase tracking-wider">
+              <tr>
+                <th class="py-2.5 px-3 w-8"></th>
+                <th class="py-2.5 px-3">Data</th>
+                <th class="py-2.5 px-3">Factura</th>
+                <th class="py-2.5 px-3 text-right">Import</th>
+                <th class="py-2.5 px-3 text-center">Estat al NAS</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows_html}
+            </tbody>
+          </table>
+        </div>
+      </form>
     </div>
     """
     return HTMLResponse(modal_html)

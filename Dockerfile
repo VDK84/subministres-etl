@@ -22,15 +22,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && playwright install --with-deps chromium \
-    && mkdir -p /data/factures && chmod 777 /data/factures
+    && apt-get purge -y --auto-remove gcc libffi-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Crear usuari no-root per seguretat (Principle of Least Privilege)
+RUN groupadd -r -g 1000 appuser && \
+    useradd -r -u 1000 -g appuser -d /app -s /sbin/nologin appuser && \
+    mkdir -p /data/factures /ms-playwright && \
+    chown -R appuser:appuser /app /data /ms-playwright
 
 # Copiar el codi de l'aplicació
-COPY src/ ./src
+COPY --chown=appuser:appuser src/ ./src
 ENV PYTHONPATH=/app
 
 # Versió SemVer injectada durant el build
-ARG APP_VERSION=0.6.0
+ARG APP_VERSION=0.15.0
 ENV APP_VERSION=${APP_VERSION}
+
+USER appuser
 
 EXPOSE 8000
 

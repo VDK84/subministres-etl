@@ -91,14 +91,24 @@ class CatgasConnector(BaseConnector):
             for att in em.attachments:
                 if not att.filename.lower().endswith(".pdf"):
                     continue
-                d_str = em.date.strftime("%Y-%m-%d") if em.date else "Data desconeguda"
-                any_str = str(em.date.year) if em.date else str(date.today().year)
-                mes_str = f"{em.date.month:02d}" if em.date else "01"
 
-                # Deduïm el nom normalitzat del fitxer al NAS
-                clean_name = re.sub(r"[^A-Za-z0-9_-]", "_", att.filename.replace(".pdf", "").replace(".PDF", ""))
-                expected_filename = f"{any_str}_{mes_str}_{self.name}_{clean_name}.pdf"
-                parsed_amt = parse_euro_amount(em.subject) or parse_euro_amount(em.body_text) or 0.0
+                metriques = self.extract_metrics_from_pdf(att.data)
+                if metriques:
+                    any_str = str(metriques.data_emissio.year)
+                    mes_str = f"{metriques.data_emissio.month:02d}"
+                    clean_num = metriques.numero_factura.replace("/", "_").replace("\\", "_").replace(" ", "")
+                    expected_filename = f"{any_str}_{mes_str}_{self.name}_{clean_num}.pdf"
+                    d_str = str(metriques.data_emissio)
+                    parsed_amt = metriques.import_total
+                    num_display = metriques.numero_factura
+                else:
+                    d_str = em.date.strftime("%Y-%m-%d") if em.date else "Data desconeguda"
+                    any_str = str(em.date.year) if em.date else str(date.today().year)
+                    mes_str = f"{em.date.month:02d}" if em.date else "01"
+                    clean_name = re.sub(r"[^A-Za-z0-9_-]", "_", att.filename.replace(".pdf", "").replace(".PDF", ""))
+                    expected_filename = f"{any_str}_{mes_str}_{self.name}_{clean_name}.pdf"
+                    parsed_amt = parse_euro_amount(em.subject) or parse_euro_amount(em.body_text) or 0.0
+                    num_display = att.filename.replace(".pdf", "")
 
                 ja_al_nas = storage.exists(self.tipus.value, self.name, any_str, expected_filename)
                 invoices.append(
@@ -107,7 +117,7 @@ class CatgasConnector(BaseConnector):
                         "proveidor": self.name,
                         "tipus": self.tipus.value,
                         "data": d_str,
-                        "numero": att.filename.replace(".pdf", ""),
+                        "numero": num_display,
                         "import": parsed_amt,
                         "subject": em.subject,
                         "exists_in_nas": ja_al_nas,
