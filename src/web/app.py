@@ -250,8 +250,13 @@ def list_nas_invoices() -> list[dict[str, Any]]:
                 else:
                     try:
                         pdf_data = pdf_path.read_bytes()
-                        txt = extract_text_from_pdf_bytes(pdf_data)
-                        import_val = parse_euro_amount(txt)
+                        conn = CONNECTORS_MAP.get(proveidor.lower())
+                        metriques = conn.extract_metrics_from_pdf(pdf_data) if conn else None
+                        if metriques and metriques.import_total is not None:
+                            import_val = metriques.import_total
+                        else:
+                            txt = extract_text_from_pdf_bytes(pdf_data)
+                            import_val = parse_euro_amount(txt)
                         if import_val is not None:
                             _pdf_amount_cache[str(rel_path)] = (stat.st_mtime, import_val)
                     except (OSError, RuntimeError, ValueError):
@@ -804,8 +809,10 @@ async def delete_invoice(rel_path: str):
             numero_factura = match[1]
             break
 
-    # 1. Eliminar del NAS
+    # 1. Eliminar del NAS i de la memòria cau
     deleted_nas = storage.delete_pdf(rel_path)
+    _pdf_amount_cache.pop(rel_path, None)
+    _pdf_amount_cache.pop(rel_path.replace("/", "\\"), None)
 
     # 2. Eliminar d'InfluxDB
     deleted_influx = False

@@ -53,12 +53,25 @@ def normalize_amount_str(val_str: str) -> float | None:
 
 
 def parse_euro_amount(text: str) -> float | None:
-    """Extreu el primer import en format monetari (ex: 45,67 € o 9.92€) i el converteix a float."""
-    match = re.search(r"(\d+(?:[.,]\d{1,2})?)\s*€", text)
-    if not match:
-        match = re.search(r"TOTAL[:\s]+(\d+(?:[.,]\d{1,2})?)", text, re.IGNORECASE)
-    if match:
-        return normalize_amount_str(match.group(1))
+    """Extreu l'import total monetari (ex: 45,67 € o 9.92 €) prioritzant etiquetes de total."""
+    # 1. Prioritzar etiquetes explícites de total amb decimals
+    total_patterns = [
+        r"(?:TOTAL\s+A\s+PAGAR|TOTAL\s+FACTURA|IMPORT\s+TOTAL|IMPORTE\s+TOTAL)[^0-9]{0,40}?(\d{1,4}[.,]\d{2})\s*€",
+        r"(\d{1,4}[.,]\d{2})\s*€\s*(?:TOTAL\s+FACTURA|TOTAL\s+A\s+PAGAR)",
+        r"TOTAL[:\s]+(\d{1,4}[.,]\d{2})\s*€?",
+    ]
+    for pat in total_patterns:
+        match = re.search(pat, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            val = normalize_amount_str(match.group(1))
+            if val is not None:
+                return val
+
+    # 2. Fallback: cercar imports amb decimals explícits seguits de €
+    matches = re.findall(r"(\d{1,4}[.,]\d{2})\s*€", text)
+    if matches:
+        # En moltes factures l'import total és l'últim o el més rellevant amb decimals
+        return normalize_amount_str(matches[-1])
     return None
 
 

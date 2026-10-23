@@ -1,5 +1,6 @@
 # pyright: reportMissingImports=false
 import logging
+import re
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -289,15 +290,26 @@ class DigiConnector(BaseConnector):
             text, r"(?:Fecha\s*de\s*emisi[óo]n|Data\s*d'emissi[óo]):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
         )
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
+        if not data_emissio and num_factura:
+            # Deducim l'any i el mes del patró oficial DGFC + AA + MM
+            dgfc_match = re.search(r"DGFC(\d{2})(\d{2})", num_factura)
+            if dgfc_match:
+                try:
+                    any_d = 2000 + int(dgfc_match.group(1))
+                    mes_d = int(dgfc_match.group(2))
+                    data_emissio = date(any_d, mes_d, 1)
+                except ValueError:
+                    pass
 
-        # 3. Import total (prioritzant el total oficial de factura)
+        # 3. Import total (prioritzant el total oficial de factura amb 2 decimals)
         total_eur = extract_float_value(
-            text, r"(?:Total\s*a\s*pagar.*?|TOTAL\s*FACTURA.*?|Import\s*total.*?):\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
+            text,
+            r"(?:Total\s*a\s*pagar|TOTAL\s*FACTURA|Import\s*total|Importe\s*total)[^0-9\n]{0,30}?[:\s]\s*(\d{1,4}[.,]\d{2})\s*€?",
         )
         if total_eur is None:
-            total_eur = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*€\s*TOTAL\s*FACTURA")
+            total_eur = extract_float_value(text, r"(\d{1,4}[.,]\d{2})\s*€?\s*TOTAL\s*FACTURA")
         if total_eur is None:
-            total_eur = extract_float_value(text, r"TOTAL\s*SERVICIOS\s*(\d+(?:[.,]\d{1,2})?)\s*€?")
+            total_eur = extract_float_value(text, r"TOTAL\s*SERVICIOS[^0-9]{0,20}?(\d{1,4}[.,]\d{2})\s*€?")
         if total_eur is None:
             total_eur = parse_euro_amount(text)
 

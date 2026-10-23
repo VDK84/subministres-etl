@@ -1,319 +1,273 @@
-# 🛠️ Pla d'Acció i Refactorització per a l'Agent IA (`subministres-etl`)
-
-Aquest document conté les instruccions detallades, correccions de *bugs*, millores de seguretat i optimitzacions de rendiment que cal aplicar al repositori `subministres-etl`. 
-
-> **Instruccions per a l'Agent:** Aplica les tasques següents en ordre. Verifica que tots els tests o comprovacions de tipus (`ruff`, `pyright`) continuïn passant després de cada bloc de canvis.
-
-### 📊 Estat d'Execució
-- **🔴 BLOC 1 (Bugs Lògics i Connectors):** ✅ Aplicat i verificat (v0.14.0)
-- **🛡️ BLOC 2 (Seguretat, XSS, Path Traversal & 50MB Limit):** ✅ Aplicat i verificat (v0.14.0)
-- **⚡ BLOC 3 (Asincronia, Event Loop & IMAP Headers):** ✅ Aplicat i verificat (v0.15.0)
-- **🧹 BLOC 4 (Lifespan, Neteja de Dependències & Helm CronJob):** ✅ Aplicat i verificat (v0.15.0)
+He trobat exactament per què et surten **992.00 €** a totes les factures de Digi (i també uns quants detalls més que es veuen a la captura i al codi).
 
 ---
 
-## 🔴 BLOC 1: Correcció d'Errors Lògics i Bugs Crítics (✅ Aplicat)
+### 1. El misteri dels 992.00 € a Digi (Bug a `app.py` + `pdf_parser.py` + `digi.py`)
 
-### 1.1. Arreglar l'extracció de dates del període facturat (Regex)
-* **Fitxers afectats:** `src/pdf_parser.py`, `src/connectors/bonpreu.py`, `src/connectors/catgas.py`, `src/connectors/digi.py`, `src/connectors/veolia.py`
-* **Problema:** `extract_regex_first` només retorna `m.group(1)`. Les expressions regulars dels connectors tenen 2 grups de captura per a la data d'inici i la data de fi, de manera que la segona data es perd sempre i `dt_inici`, `dt_fi` i `dies_facturats` sempre són `None`.
-* **Solució:** Crea una funció dedicada `extract_date_range` a `src/pdf_parser.py` i utilitza-la als 4 connectors.
+Hi ha una combinació de tres factors que provoquen aquest `992.00 €`:
 
-**Afegir a `src/pdf_parser.py`:**
+1. **A `list_nas_invoices()` (`src/web/app.py`), si l'import no es troba a InfluxDB, fas servir `parse_euro_amount(txt)` en lloc del parser específic del proveïdor (`conn.extract_metrics_from_pdf`):**
 ```python
-def extract_date_range(text: str, pattern: str) -> tuple[date | None, date | None]:
-    """Cerca un patró regex amb dos grups de captura de data i retorna (data_inici, data_fi)."""
-    m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-    if m and len(m.groups()) >= 2:
-        dt_inici = parse_date_catalan_spanish(m.group(1).strip())
-        dt_fi = parse_date_catalan_spanish(m.group(2).strip())
-        return dt_inici, dt_fi
-    return None, None
+# Línia 235 de src/web/app.py
+pdf_data = pdf_path.read_bytes()
+txt = extract_text_from_pdf_bytes(pdf_data)
+import_val = parse_euro_amount(txt) # <-- ERROR! Agafa el primer número seguit d'€ de tot el PDF!
+
 ```
 
-**Reemplaçar als 4 connectors (`bonpreu.py`, `catgas.py`, `digi.py`, `veolia.py`):**
-```python
-# Exemple per a bonpreu.py / veolia.py (adaptar el patró segons el connector):
-dt_inici, dt_fi = extract_date_range(
-    text,
-    r"(?:Per[íi]ode\s*facturat|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:a|fins\s*a|al|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-)
-```
+
+`parse_euro_amount(txt)` fa `re.search(r"(\d+(?:[.,]\d{1,2})?)\s*€", text)`, que captura **la primera xifra seguida del símbol `€` que apareix en tot el document PDF**. En una factura de Digi, abans del total hi ha taules de tarifes, límits o textos legals o preus de primera línia (per exemple `9,92 €` d'algun concepte fix o un codi acabat en `992`).
+
+
+2. **Per què un `9,92 €` es converteix en `992.00 €` o d'on surt `992`?**
+* A les factures de Digi, el total real s'escriu sovint amb espai o salt de línia entre l'etiqueta i la xifra (ex: `TOTAL FACTURA (IVA incluido) 35,00 €` o en dues columnes).
+
+
+* A `src/connectors/digi.py` (línia 275), les teves regex exigeixen que hi hagi dos punts `:` (`r"(?:Total\s*a\s*pagar.*?|TOTAL\s*FACTURA.*?|Import\s*total.*?):\s*(\d+...)"`) o bé que el número vagi **abans** de `TOTAL FACTURA` (`r"(\d+...)\s*€\s*TOTAL\s*FACTURA"`). Com que al PDF de Digi posa `TOTAL FACTURA` **sense dos punts** i després l'import, les tres primeres regex fallen i `digi.py` acaba caient també al fallback `parse_euro_amount(text)`!
+
+
+* I per què dóna `992.00` a totes les factures de 2024 i 2026? Perquè al peu o capçalera de totes les factures de Digi hi apareix el text legal del **Registre Mercantil de Madrid** (o Capital Social / dades fiscals de DIGI SPAIN TELECOM S.L.U.) o bé un import amb format que `pypdf` extreu sense espai o amb punt (ex: `Tomo ... Folio ... Hoja ...` o bé un preu que `pypdf` ajunta amb un índex de taula) Just davant d'un símbol `€`! Encara més probable: a `normalize_amount_str`, o bé en el text extret per `pypdf`, un import com `9,92 €` si `pypdf` no extreu la coma (passa quan la coma té una font diferent o subíndex en alguns PDFs) queda com `992 €` -> `992.00 €`!
+
+
+
+
 
 ---
 
-### 1.2. Evitar la creació de fitxers PDF buits (`0 bytes`) al NAS
-* **Fitxer afectat:** `src/connectors/base.py`
-* **Problema:** Quan `bonpreu.py` o `digi.py` reben un avís per email però no tenen credencials de portal, criden `self.save_and_ingest(b"", metriques_avis, ...)`, generant un fitxer `.pdf` corrupte de 0 bytes al NAS Samba.
-* **Solució:** Modificar `save_and_ingest` perquè només desi al NAS si `pdf_bytes` conté dades.
+### 2. Altres errors detectats (a la captura de pantalla i al codi)
 
-**Modificar a `src/connectors/base.py`:**
+* **Capçalera de la taula transparent (es veu a la teva captura de pantalla):**
+Fixa't a dalt de tot de la taula de la teva imatge: el text `PROVEÏDOR | TIPUS | ANY...` s'està cavalcant amb la primera fila (`DIGI | telefonia | 2024 | Mar (03) | 992.00 €`)!
+
+
+* **Causa:** A `index.html` (línia 235), el `<thead>` té `bg-slate-950/80` (80% d'opacitat) i `sticky top-0`, però li falta `z-10` i un fons 100% opac (`bg-slate-950`). Quan fas scroll avall, les files passen per sota i es transparenten a través del header.
+
+
+
+
+* **Quan elimines una factura, no s'esborra de la memòria cau `_pdf_amount_cache`:**
+A `src/web/app.py`, has afegit `_pdf_amount_cache`, però a `delete_invoice` no fas `_pdf_amount_cache.pop(rel_path, None)`.
+
+
+* **InfluxDB sobreescriu factures si dues factures s'emeten el mateix dia (Timestamp Collision):**
+A `src/influx_writer.py` (línia 46):
 ```python
-    def save_and_ingest(
-        self,
-        pdf_bytes: bytes,
-        metriques: FacturaMetriques,
-        origen: str,
-    ) -> FacturaResult:
-        """Desa el fitxer PDF al volum NAS (si n'hi ha) i envia les mètriques a InfluxDB."""
-        any_str = str(metriques.data_emissio.year)
-        mes_str = f"{metriques.data_emissio.month:02d}"
-        clean_num = metriques.numero_factura.replace("/", "_").replace("\\", "_").replace(" ", "")
-        filename = f"{any_str}_{mes_str}_{self.name}_{clean_num}.pdf"
+dt = datetime.combine(metriques.data_emissio, time(12, 0, 0), tzinfo=UTC)
 
-        pdf_saved_path: str | None = None
-        nou_descarregat = False
-
-        if pdf_bytes:
-            ja_existeix = storage.exists(self.tipus.value, self.name, any_str, filename)
-            if not ja_existeix or settings.DRY_RUN:
-                path = storage.save_pdf(
-                    file_bytes=pdf_bytes,
-                    tipus=self.tipus.value,
-                    proveidor=self.name,
-                    any_str=any_str,
-                    filename=filename,
-                )
-                pdf_saved_path = str(path)
-                nou_descarregat = True
-            else:
-                self.logger.info(f"La factura {filename} ja existeix al NAS Samba. Ometent sobreescriptura.")
-                dest_dir = storage.get_destination_dir(self.tipus.value, self.name, any_str)
-                pdf_saved_path = str(dest_dir / filename)
-        else:
-            self.logger.info(f"Sense contingut PDF per a {metriques.numero_factura} (origen={origen}). Ometent escriptura al NAS.")
 ```
+
+
+I a `digi.py` / `veolia.py` / `bonpreu.py`, quan el parser no troba la data d'emissió al PDF, fa servir `data_emissio or date.today()`.
+
+
+* Fixa't a la teva captura: tens `2024_01_digi_DGFC2401214963.pdf`, `2024_07_digi...`, `2024_11_digi...`. D'on ha tret l'any `2024` i el mes `01`, `07`, `11` si a `digi.py` la data d'emissió només busca `Fecha de emisión:`? Ho ha tret bé, **però** a `get_factures_amounts()` (línia 134 de `influx_writer.py`), la consulta Flux fa:
+
+
+```flux
+from(bucket: "energy_data")
+  |> range(start: -10y)
+  |> filter(fn: (r) => r["_measurement"] == "factures_subministres" and r["_field"] == "import_total")
+
+```
+
+
+Quan InfluxDB retorna el CSV amb múltiples sèries (una taula per cada `numero_factura` diferent), **`csv.DictReader(io.StringIO(resp.text))` falla a partir de la segona taula!**
+
+* **Per què?** El format CSV annotat d'InfluxDB v2 insereix línies d'anotació (`#datatype`, `#group`, `#default`) i **una nova fila de capçaleres** cada vegada que canvia un tag (`numero_factura`), o bé comença el fitxer amb 3 línies de `#`! Com que `csv.DictReader` llegeix la primera línia del CSV (`#group,false,false...`) com si fossin els noms de les columnes (`fieldnames`), `row.get("numero_factura")` i `row.get("_value")` retornen **sempre `None**`!
+
+
+* **Conseqüència directa:** `amounts_map` (`get_factures_amounts()`) està **SEMPRE BUIT (`{}`)**! Per això `list_nas_invoices()` mai llegeix cap import d'InfluxDB i sempre cau al fallback defectuós `parse_euro_amount(txt)`!
+
+
+
+
+* **El número de factura de Digi permet identificar l'any i el mes encara que falli la data del PDF:**
+Els números de factura de Digi segueixen sempre el patró `DGFC` + `AA` (any) + `MM` (mes) + sequencial (ex: `DGFC2403759707` = 2024, mes 03; `DGFC2623970096` = 2026).
+
+
 
 ---
 
-### 1.3. Persistir l'estat del Circuit Breaker a la Web UI (Singleton de Connectors)
-* **Fitxer afectat:** `src/web/app.py`
-* **Problema:** `get_all_connectors_map()` crea noves instàncies cada vegada que es crida, esborrant `self.consecutive_failures` i `self.cooldown_until`.
-* **Solució:** Mantenir una única instància global dels connectors en memòria.
+### Fitxer d'instruccions per a l'Agent (Fase 3)
 
-**Modificar a `src/web/app.py`:**
-```python
-CONNECTORS_MAP: dict[str, BaseConnector] = {
-    "veolia": VeoliaConnector(),
-    "catgas": CatgasConnector(),
-    "bonpreu": BonpreuConnector(),
-    "digi": DigiConnector(),
-}
+Aquí tens el document amb les solucions exactes i els snippets de codi per passar-li al teu agent i arreglar l'import de Digi, la lectura CSV d'InfluxDB i la taula d'`index.html`.
 
-def get_all_connectors_map() -> dict[str, BaseConnector]:
-    return CONNECTORS_MAP
-```
+```markdown
+# Pla de Correcció (Fase 3) — Fix Imports Digi (992€), Parser CSV InfluxDB i UI
+
+Aquest document corregeix el bug dels imports erronis (`992.00 €`) a les factures de Digi, el parser CSV de l'API REST d'InfluxDB (que retornava sempre `{}`) i el solapament visual de la capçalera de la taula.
 
 ---
 
-### 1.4. Corregir el `case-sensitivity` en esborrar factures d'InfluxDB
-* **Fitxer afectat:** `src/web/app.py`
-* **Problema:** A `delete_invoice`, es converteix `numero_factura` a minúscules amb `.lower()`, però a InfluxDB el tag `numero_factura` es desa amb majúscules (ex: `FG2026_001234`), fent que el predicat d'eliminació no coincideixi mai.
-* **Solució:** Extreure el número de factura preservant majúscules i minúscules.
+## 1. Corregir `get_factures_amounts()` a `src/influx_writer.py`
 
-**Modificar a `src/web/app.py` (dins `delete_invoice`):**
-```python
-    stem = Path(rel_path).stem
-    numero_factura = stem
-    for p in ["bonpreu", "digi", "veolia", "catgas"]:
-         match = re.split(rf"_{p}_", stem, maxsplit=1, flags=re.IGNORECASE)
-        if len(match) == 2:
-            numero_factura = match[1]
-            break
-```
+### Problema
+L'API `/api/v2/query` d'InfluxDB retorna un CSV amb comentaris inicials (`#group`, `#datatype`, `#default`) i múltiples taules. Passar `resp.text` directament a `csv.DictReader` fa que prengui la primera línia `#` com a capçalera i `row.get("numero_factura")` sigui sempre `None` (retornant `{}`).
 
----
-
-### 1.5. Evitar duplicació de PDFs en correus `.eml` imbricats
-* **Fitxer afectat:** `src/email_client.py`
-* **Problema:** Quan es troba un `.eml` adjunt, els seus PDFs s'afegeixen a `attachments` del correu pare amb `attachments.extend(sub_parsed.attachments)` i alhora s'itera sobre `nested_emails` a `fetch_recent_emails`.
-* **Solució:** Eliminar la línia `attachments.extend(sub_parsed.attachments)` dins de `_parse_message` a `src/email_client.py`, deixant que cada `ParsedEmail` (pare o fill) gestioni únicament els seus propis adjunts.
-
----
-
-## 🛡️ BLOC 2: Seguretat i Prevenció de Vulnerabilitats (✅ Aplicat)
-
-### 2.1. Prevenir XSS (Cross-Site Scripting) als fragments HTML
-* **Fitxer afectat:** `src/web/app.py`
-* **Problema:** S'injecten cadenes de logs i metadades de correus directament en HTML sense escapar.
-* **Solució:** Importar `html` i aplicar `html.escape()` a totes les variables dinàmiques dins de `get_connector_history` i `upload_invoice_files`.
-
-**Modificar a `src/web/app.py`:**
-```python
-import html
-
-# Dins de get_connector_history:
-inv_id = html.escape(str(inv.get("id", "")))
-inv_data = html.escape(str(inv.get("data", "-")))
-inv_num = html.escape(str(inv.get("numero", "-")))
-```
-
----
-
-### 2.2. Corregir validació de Path Traversal i Zip Bomb
-* **Fitxers afectats:** `src/storage.py`, `src/web/app.py`
-* **Problema 1:** `str(target).startswith(str(base_path))` és vulnerable a col·lisions de prefix de carpeta (ex: `/data/factures_altres`).
-* **Problema 2:** `/api/upload` llegeix fitxers i descomprimeix ZIPs en memòria sense límit de mida.
-* **Solució:** Usar `Path.is_relative_to()` i limitar la mida dels fitxers pujats/descomprimits.
-
-**Modificar a `src/storage.py` (i replicar a `view_pdf` i `download_pdf` de `src/web/app.py`):**
-```python
-    def delete_pdf(self, rel_path: str) -> bool:
-        """Elimina un fitxer del NAS Samba de forma segura."""
-        base_resolved = self.base_path.resolve()
-        target = (base_resolved / rel_path).resolve()
-        if not target.is_relative_to(base_resolved) or not target.is_file():
-            return False
-        if settings.DRY_RUN:
-            logger.info(f"[DRY-RUN] S'eliminaria el fitxer a: {target}")
-            return True
-        target.unlink(missing_ok=True)
-        logger.info(f"Fitxer eliminat correctament del NAS: {target}")
-        return True
-```
-
-**Modificar a `src/web/app.py` (dins `upload_invoice_files`):**
-```python
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB màxim
-
-content = await file.read(MAX_UPLOAD_BYTES + 1)
-if len(content) > MAX_UPLOAD_BYTES:
-    raise HTTPException(status_code=413, detail="El fitxer supera el límit màxim de 50 MB.")
-
-# I dins del bucle del ZIP:
-for zinfo in z.infolist():
-    if zinfo.is_dir() or zinfo.file_size > MAX_UPLOAD_BYTES:
-        continue
-```
-
----
-
-## ⚡ BLOC 3: Optimització de Rendiment i Asincronia (✅ Aplicat)
-
-### 3.1. Desbloquejar l'Event Loop de FastAPI
-* **Fitxer afectat:** `src/web/app.py`
-* **Problema:** Els endpoints `async def index` i `async def get_connector_history` fan crides síncrones bloquejants (lectura de NAS Samba, peticions `requests` a InfluxDB i connexions `imaplib`). Això congela l'Event Loop i atura l'emissió per WebSocket mentre duren.
-* **Solució:** Executar les funcions pesades en un fil separat amb `asyncio.to_thread`.
-
-**Modificar a `src/web/app.py`:**
-```python
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    """Pàgina principal amb dashboard operatiu i controls."""
-    invoices = await asyncio.to_thread(list_nas_invoices)
-    # ... resta del codi igual
-```
+### Canvi a aplicar a `src/influx_writer.py`
+Substituir el mètode `get_factures_amounts` per aquest (filtrant les línies `#` o utilitzant `query_api` oficial):
 
 ```python
-@app.get("/api/history/{connector}")
-async def get_connector_history(connector: str):
-    """Consulta les factures històriques disponibles sense bloquejar l'event loop."""
-    connectors = get_all_connectors_map()
-    conn = connectors.get(connector.lower())
-    if not conn:
-        raise HTTPException(status_code=404, detail=f"Proveïdor '{connector}' desconegut.")
+    def get_factures_amounts(self) -> dict[str, float]:
+        """Recupera un mapa {numero_factura_lower: import_total} d'InfluxDB."""
+        if not self.is_configured():
+            return {}
 
-    invoices = await asyncio.to_thread(conn.fetch_available_invoices, imap_client)
-    # ... resta del codi igual
-```
-
----
-
-### 3.2. Optimitzar `ImapMailboxClient` per no descarregar correus innecessaris
-* **Fitxer afectat:** `src/email_client.py`
-* **Problema:** `client.fetch(mail_id, "(RFC822)")` descarrega el correu sencer (amb tots els adjunts en binari) per a tots els correus dels últims 60/730 dies abans de comprovar si el remitent (`From`) o l'assumpte (`Subject`) coincideixen amb `sender_filters`.
-* **Solució:** Descarregar primer només les capçaleres (`BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)]`), filtrar en memòria i descarregar el cos complet `(RFC822)` només dels correus que coincideixin.
-
-**Modificar a `src/email_client.py` (dins `fetch_recent_emails`):**
-```python
-                for mail_id in mail_ids:
-                    # 1. Baixar només capçaleres per filtrar ràpidament
-                    if sender_filters:
-                        _, hdr_data = client.fetch(mail_id, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
-                        if hdr_data and hdr_data[0] and isinstance(hdr_data[0][1], bytes):
-                            hdr_msg = email.message_from_bytes(hdr_data[0][1])
-                            h_sender = decode_str(hdr_msg.get("From", "")).lower()
-                            h_subject = decode_str(hdr_msg.get("Subject", "")).lower()
-                            # Nota: si l'usuari reenvia correus .eml, potser l'assumpte conté "Fwd:" o el proveïdor
-                            if not any(f.lower() in h_sender or f.lower() in h_subject for f in sender_filters):
+        flux_query = (
+            f'from(bucket: "{self.bucket}") '
+            "|> range(start: -10y) "
+            '|> filter(fn: (r) => r["_measurement"] == "factures_subministres" and r["_field"] == "import_total") '
+            "|> last()"
+        )
+        result_map: dict[str, float] = {}
+        try:
+            with InfluxDBClient(url=self.url, token=self.token, org=self.org, timeout=5000) as client:
+                tables = client.query_api().query(flux_query, org=self.org)
+                for table in tables:
+                    for record in table.records:
+                        num = record.values.get("numero_factura")
+                        val = record.get_value()
+                        if num and val is not None:
+                            try:
+                                result_map[str(num).strip().lower()] = float(val)
+                            except (ValueError, TypeError):
                                 continue
+        except (InfluxDBError, urllib3.exceptions.HTTPError, OSError) as err:
+            logger.debug(f"No s'ha pogut obtenir mapa d'imports d'InfluxDB: {err}")
+        return result_map
 
-                    # 2. Baixar el correu complet només si ha passat el filtre
-                    _, msg_data = client.fetch(mail_id, "(RFC822)")
 ```
 
 ---
 
-## 🧹 BLOC 4: Neteja de Codi, Dependències i Infraestructura (✅ Aplicat)
+## 2. Corregir l'extracció de l'import total a `src/connectors/digi.py` i `src/pdf_parser.py`
 
-### 4.1. Migrar `@app.on_event("startup")` a `lifespan`
-* **Fitxer afectat:** `src/web/app.py`
-* **Problema:** `on_event("startup")` està deprecat a FastAPI.
-* **Solució:** Usar `asynccontextmanager` per al `lifespan`.
+### Problema
 
-**Modificar a `src/web/app.py`:**
+1. A les factures en PDF de Digi, l'import total apareix com `TOTAL FACTURA 25,00 €` o `TOTAL A PAGAR 25,00 €` (sovint sense dos punts `:` o amb salts de línia). Com que les regex de `digi.py` exigien `:`, fallaven i queien al fallback `parse_euro_amount(text)`.
+2. `parse_euro_amount(text)` fa `re.search` i agafa el **primer** número amb `€` o amb la paraula `TOTAL` de tot el PDF (que a Digi coincideix amb dades fiscals/tarifes on surt `992`), en lloc de buscar l'import amb decimals al final.
+
+### Canvi 1: Millorar `parse_euro_amount` a `src/pdf_parser.py`
+
+Exigir decimals (`[.,]\d{2}`) en el fallback genèric per no capturar codis postals, registres mercantils o telèfons, i prioritzar els imports de "Total a pagar / Total factura":
+
 ```python
-from contextlib import asynccontextmanager
+def parse_euro_amount(text: str) -> float | None:
+    """Extreu l'import total monetari (ex: 45,67 € o 9.92 €) prioritzant etiquetes de total."""
+    # 1. Prioritzar etiquetes explícites de total amb decimals
+    total_patterns = [
+        r"(?:TOTAL\s+A\s+PAGAR|TOTAL\s+FACTURA|IMPORT\s+TOTAL|IMPORTE\s+TOTAL)[^0-9]{0,40}?(\d{1,4}[.,]\d{2})\s*€",
+        r"(\d{1,4}[.,]\d{2})\s*€\s*(?:TOTAL\s+FACTURA|TOTAL\s+A\s+PAGAR)",
+        r"TOTAL[:\s]+(\d{1,4}[.,]\d{2})\s*€?",
+    ]
+    for pat in total_patterns:
+        match = re.search(pat, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            val = normalize_amount_str(match.group(1))
+            if val is not None:
+                return val
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global main_loop
-    main_loop = asyncio.get_running_loop()
-    await asyncio.to_thread(auto_annotate_k8s_pod)
-    yield
+    # 2. Fallback: cercar imports amb decimals explícits seguits de €
+    matches = re.findall(r"(\d{1,4}[.,]\d{2})\s*€", text)
+    if matches:
+        # En moltes factures l'import total és l'últim o el més rellevant amb decimals
+        return normalize_amount_str(matches[-1])
+    return None
 
-app = FastAPI(title="Subministres ETL", version=settings.APP_VERSION, lifespan=lifespan)
+```
+
+### Canvi 2: Actualitzar `extract_metrics_from_pdf` a `src/connectors/digi.py`
+
+Fer que les regex d'import total de Digi no exigeixin `:` obligatòriament i exigeixin 2 decimals (`\d{1,4}[.,]\d{2}`):
+
+```python
+        # 3. Import total (prioritzant el total oficial de factura amb 2 decimals)
+        total_eur = extract_float_value(
+            text,
+            r"(?:Total\s*a\s*pagar|TOTAL\s*FACTURA|Import\s*total|Importe\s*total)[^0-9\n]{0,30}?[:\s]\s*(\d{1,4}[.,]\d{2})\s*€?",
+        )
+        if total_eur is None:
+            total_eur = extract_float_value(text, r"(\d{1,4}[.,]\d{2})\s*€?\s*TOTAL\s*FACTURA")
+        if total_eur is None:
+            total_eur = extract_float_value(text, r"TOTAL\s*SERVICIOS[^0-9]{0,20}?(\d{1,4}[.,]\d{2})\s*€?")
+        if total_eur is None:
+            total_eur = parse_euro_amount(text)
+
 ```
 
 ---
 
-### 4.2. Eliminar dependències no utilitzades
-* **Fitxers afectats:** `requirements.txt`, `pyproject.toml`
-* **Acció:** Eliminar les dependències que no s'importen en cap lloc del codi per reduir la mida de la imatge Docker i la superfície d'atac:
-  * `pdfplumber>=0.11.0`
-  * `pyyaml>=6.0.1`
-  * `beautifulsoup4>=4.12.3`
-  * `tenacity>=8.3.0`
+## 3. Utilitzar el parser del connector a `list_nas_invoices()` (`src/web/app.py`)
 
----
+### Problema
 
-### 4.3. Corregir el CronJob al Helm Chart
-* **Fitxer afectat:** `helm/subministres-etl/templates/cronjob.yaml` i `helm/subministres-etl/values.yaml`
-* **Problema:** El `Dockerfile` té `CMD ["uvicorn", "src.web.app:app", ...]`. Si es desplega en mode `cronjob` sense especificar `args` o `command`, el Job arrenca el servidor web Uvicorn i no acaba mai.
-* **Solució:** Definir `command: ["subministres-etl"]` per defecte a `cronjob.yaml`.
+A `src/web/app.py` (línia 236), quan `list_nas_invoices()` no troba l'import a InfluxDB, feia `parse_euro_amount(txt)` directament en comptes d'utilitzar `conn.extract_metrics_from_pdf(pdf_data)`. A més, en eliminar una factura no es netejava `_pdf_amount_cache`.
 
-**Modificar a `helm/subministres-etl/templates/cronjob.yaml`:**
-```yaml
-          containers:
-            - name: {{ .Chart.Name }}
-              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-              imagePullPolicy: {{ .Values.image.pullPolicy }}
-              command: ["subministres-etl"]
-              {{- if .Values.args }}
-              args:
-                {{- toYaml .Values.args | nindent 16 }}
-              {{- end }}
+### Canvi a aplicar a `src/web/app.py`
+
+Dins de `list_nas_invoices()`:
+
+```python
+            import_val = amounts_map.get(num_clean) or amounts_map.get(pdf_path.stem.lower())
+            if import_val is None:
+                cached = _pdf_amount_cache.get(str(rel_path))
+                if cached and cached[0] == stat.st_mtime:
+                    import_val = cached[1]
+                else:
+                    try:
+                        pdf_data = pdf_path.read_bytes()
+                        conn = CONNECTORS_MAP.get(proveidor.lower())
+                        metriques = conn.extract_metrics_from_pdf(pdf_data) if conn else None
+                        if metriques and metriques.import_total is not None:
+                            import_val = metriques.import_total
+                        else:
+                            txt = extract_text_from_pdf_bytes(pdf_data)
+                            import_val = parse_euro_amount(txt)
+                        if import_val is not None:
+                            _pdf_amount_cache[str(rel_path)] = (stat.st_mtime, import_val)
+                    except (OSError, RuntimeError, ValueError):
+                        pass
+
+```
+
+I dins de `delete_invoice(rel_path: str)` a `src/web/app.py`, netejar la memòria cau:
+
+```python
+    # 1. Eliminar del NAS i de la cache en memòria
+    deleted_nas = storage.delete_pdf(rel_path)
+    _pdf_amount_cache.pop(rel_path, None)
+    _pdf_amount_cache.pop(rel_path.replace("/", "\\"), None)
+
 ```
 
 ---
 
-## 💎 BLOC 5: Poliment d'Auditoria, Coherència d'Històric i Seguretat (✅ Aplicat a v0.16.0)
+## 4. Corregir el solapament del `<thead sticky>` a `src/web/templates/index.html`
 
-1. **Sincronització Històrica Real (`mode="all"`):**
-   * Endpoint `/api/sync` actualitzat per rebre `mode: str = Form(default="normal")` i propagar-lo a `run_sync_task`.
-   * Formulari d'històric enviant `<input type="hidden" name="mode" value="all">` i embolcallant els checkboxes de la taula.
-2. **Coherència en la Detecció de Factures Existents al NAS:**
-   * `CatgasConnector` i `VeoliaConnector` extreuen les mètriques reals del PDF a memòria amb `extract_metrics_from_pdf` per construir exactament el mateix patró de nom de fitxer que utilitza `save_and_ingest()`.
-   * Ja no es basen en `att.filename` ni en dates de correu imprecises.
-3. **Suport d'Històric per a Bonpreu i Digi:**
-   * Implementat `fetch_available_invoices` a `BonpreuConnector` i `DigiConnector` per consultar tant avisos com factures existents al NAS.
-4. **Prevenció XSS i Neteja a Endpoints:**
-   * Escapat estricte amb `html.escape()` per a `target_desc`, `desc` i les línies de text a `/api/logs`.
-5. **Memòria Cau en Memòria per a Lectura de Factures (`_pdf_amount_cache`):**
-   * S'evita rellegir i parsejar desenes de PDFs des de Samba a cada F5 guardant `(st_mtime, amount)` a memòria.
-   * `extract_text_from_pdf_bytes` retorna `""` buit en cas d'error en comptes del text d'excepció.
-6. **Hardening Docker, Colspan i Alineació SemVer:**
-   * Eliminats compiladors `gcc`, `libffi-dev`, `libssl-dev` després del pip install.
-   * Creat i assignat usuari no-root `appuser` (UID 1000).
-   * Corregit `colspan="9"` a la taula buida d'`index.html`.
-   * Alineades les versions a `0.15.0` / `0.16.0` a `Dockerfile`, `config.py`, `pyproject.toml`, `Chart.yaml` i `src/__init__.py`.
+### Problema
+
+A la taula de factures (`#invoices-table`), el `<thead>` té `bg-slate-950/80` (semi-transparent) i li falta `z-10`. Quan es fa scroll, el text de la primera fila es veu a sota dels títols de columna.
+
+### Canvi a aplicar a `src/web/templates/index.html` (línia 235)
+
+Canviar:
+
+```html
+<thead class="bg-slate-950/80 text-slate-400 uppercase text-[10px] tracking-wider sticky top-0 select-none">
+
+```
+
+Per:
+
+```html
+<thead class="bg-slate-950 text-slate-400 uppercase text-[10px] tracking-wider sticky top-0 z-10 border-b border-slate-800 select-none">
+
+```
+
+```
+
+---
+
+> **Nota important un cop aplicat aquest canvi:** Com que les 48 factures de Digi que ja s'han descarregat avui han enviat el valor `992.0` a InfluxDB durant la primera sincronització, quan apliquis el fix i reiniciïs el contenidor, fes una re-sincronització d'històric de Digi (o executa un esborrat de mètriques de `digi` a InfluxDB) perquè es sobreescriguin els punts `992.0` d'InfluxDB amb els imports reals de cada PDF!
+
+```
