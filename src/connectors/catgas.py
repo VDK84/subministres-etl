@@ -8,6 +8,7 @@ from src.connectors.base import BaseConnector
 from src.email_client import ImapMailboxClient
 from src.models import FacturaMetriques, FacturaResult, SubministreType
 from src.pdf_parser import (
+    extract_date_range,
     extract_float_value,
     extract_regex_first,
     extract_text_from_pdf_bytes,
@@ -153,17 +154,10 @@ class CatgasConnector(BaseConnector):
         consum_m3 = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*m[3³]")
 
         # 5. Dates del període
-        periode_raw = extract_regex_first(
+        dt_inici, dt_fi = extract_date_range(
             text,
             r"(?:Per[íi]ode\s*de\s*facturaci[óo]|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:fins\s*a|a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         )
-        dt_inici: date | None = None
-        dt_fi: date | None = None
-        if periode_raw:
-            parts = re.split(r"\s*(?:fins\s*a|a|-)\s*", periode_raw)
-            if len(parts) == 2:
-                dt_inici = parse_date_catalan_spanish(parts[0])
-                dt_fi = parse_date_catalan_spanish(parts[1])
 
         # 6. CUPS de gas (ES02...)
         cups = extract_regex_first(text, r"(ES\d{16,20}[A-Za-z]{0,2})")

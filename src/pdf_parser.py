@@ -102,6 +102,16 @@ def extract_regex_first(text: str, pattern: str, group: int = 1) -> str | None:
     return m.group(group).strip() if m else None
 
 
+def extract_date_range(text: str, pattern: str) -> tuple[date | None, date | None]:
+    """Cerca un patró regex amb dos grups de captura de data i retorna (data_inici, data_fi)."""
+    m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+    if m and len(m.groups()) >= 2:
+        dt_inici = parse_date_catalan_spanish(m.group(1).strip())
+        dt_fi = parse_date_catalan_spanish(m.group(2).strip())
+        return dt_inici, dt_fi
+    return None, None
+
+
 def extract_float_value(text: str, pattern: str, group: int = 1) -> float | None:
     """Cerca un valor numèric amb regex i el converteix a float de forma robusta."""
     val = extract_regex_first(text, pattern, group)

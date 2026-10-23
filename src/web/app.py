@@ -1,9 +1,11 @@
 # pyright: reportMissingImports=false
 import asyncio
 import email
+import html
 import io
 import logging
 import os
+import re
 import zipfile
 from collections import deque
 from datetime import date, datetime
@@ -165,13 +167,16 @@ execution_state: dict[str, Any] = {
 }
 
 
-def get_all_connectors_map():
-    return {
-        "veolia": VeoliaConnector(),
-        "catgas": CatgasConnector(),
-        "bonpreu": BonpreuConnector(),
-        "digi": DigiConnector(),
-    }
+CONNECTORS_MAP: dict[str, Any] = {
+    "veolia": VeoliaConnector(),
+    "catgas": CatgasConnector(),
+    "bonpreu": BonpreuConnector(),
+    "digi": DigiConnector(),
+}
+
+
+def get_all_connectors_map() -> dict[str, Any]:
+    return CONNECTORS_MAP
 
 
 MESOS_CATALANS = {
@@ -485,13 +490,17 @@ async def get_connector_history(connector: str):
         )
         checked = "" if exists else "checked"
 
+        inv_id = html.escape(str(inv.get("id", "")))
+        inv_data = html.escape(str(inv.get("data", "-")))
+        inv_num = html.escape(str(inv.get("numero", "-")))
+
         html_items.append(
             f'<tr class="border-b border-slate-800/60 hover:bg-slate-800/30">'
             f'<td class="py-2.5 px-3">'
-            f'<input type="checkbox" name="selected_invoices" value="{inv.get("id")}" {checked} class="bulk-cb rounded bg-slate-900 border-slate-700 text-emerald-600 focus:ring-emerald-500">'
+            f'<input type="checkbox" name="selected_invoices" value="{inv_id}" {checked} class="bulk-cb rounded bg-slate-900 border-slate-700 text-emerald-600 focus:ring-emerald-500">'
             f"</td>"
-            f'<td class="py-2.5 px-3 font-mono text-xs text-white">{inv.get("data", "-")}</td>'
-            f'<td class="py-2.5 px-3 text-xs text-slate-300 font-mono truncate max-w-[200px]" title="{inv.get("numero", "")}">{inv.get("numero", "-")}</td>'
+            f'<td class="py-2.5 px-3 font-mono text-xs text-white">{inv_data}</td>'
+            f'<td class="py-2.5 px-3 text-xs text-slate-300 font-mono truncate max-w-[200px]" title="{inv_num}">{inv_num}</td>'
             f'<td class="py-2.5 px-3 text-xs font-semibold text-emerald-400 text-right">{inv.get("import", 0.0):.2f} €</td>'
             f'<td class="py-2.5 px-3 text-center">{badge}</td>'
             f"</tr>"
@@ -619,6 +628,9 @@ def extract_pdfs_from_eml(eml_bytes: bytes) -> list[tuple[bytes, str, str | None
     return results
 
 
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # Límit màxim de 50 MB per seguretat
+
+
 @app.post("/api/upload")
 async def upload_invoice_files(
     file: Annotated[UploadFile, File()],
@@ -635,9 +647,11 @@ async def upload_invoice_files(
             detail="Format no admès. Només es permeten fitxers .pdf, .eml o .zip.",
         )
 
-    content = await file.read()
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(content) == 0:
         raise HTTPException(status_code=400, detail="El fitxer és buit.")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="El fitxer supera el límit màxim de 50 MB.")
 
     connectors = get_all_connectors_map()
 
@@ -649,7 +663,7 @@ async def upload_invoice_files(
         try:
             with zipfile.ZipFile(io.BytesIO(content)) as z:
                 for zinfo in z.infolist():
-                    if zinfo.is_dir():
+                    if zinfo.is_dir() or zinfo.file_size > MAX_UPLOAD_BYTES:
                         continue
                     inner_name = zinfo.filename.lower()
                     if inner_name.endswith(".pdf"):
@@ -721,9 +735,9 @@ async def upload_invoice_files(
 @app.get("/api/pdf/view/{rel_path:path}")
 async def view_pdf(rel_path: str):
     """Serveix el PDF inline per obrir-lo al visor integrat del navegador."""
-    full_path = (Path(settings.NAS_MOUNT_PATH) / rel_path).resolve()
-    # Validació de seguretat path traversal
-    if not str(full_path).startswith(str(Path(settings.NAS_MOUNT_PATH).resolve())) or not full_path.exists():
+    base_resolved = Path(settings.NAS_MOUNT_PATH).resolve()
+    full_path = (base_resolved / rel_path).resolve()
+    if not full_path.is_relative_to(base_resolved) or not full_path.is_file():
         raise HTTPException(status_code=404, detail="Factura no trobada.")
 
     return FileResponse(
@@ -736,8 +750,9 @@ async def view_pdf(rel_path: str):
 @app.get("/api/pdf/download/{rel_path:path}")
 async def download_pdf(rel_path: str):
     """Descarrega el PDF directament."""
-    full_path = (Path(settings.NAS_MOUNT_PATH) / rel_path).resolve()
-    if not str(full_path).startswith(str(Path(settings.NAS_MOUNT_PATH).resolve())) or not full_path.exists():
+    base_resolved = Path(settings.NAS_MOUNT_PATH).resolve()
+    full_path = (base_resolved / rel_path).resolve()
+    if not full_path.is_relative_to(base_resolved) or not full_path.is_file():
         raise HTTPException(status_code=404, detail="Factura no trobada.")
 
     return FileResponse(
@@ -752,13 +767,14 @@ async def delete_invoice(rel_path: str):
     """Elimina una factura del NAS Samba i suprimeix les mètriques d'InfluxDB per evitar dades errònies a Grafana."""
     parts = Path(rel_path).parts
     proveidor = parts[1] if len(parts) > 1 else ""
-    filename = Path(rel_path).name
 
-    # Deduïm el número de factura
-    numero_factura = filename.replace(".pdf", "").replace(".PDF", "")
+    # Deduïm el número de factura preservant majúscules/minúscules
+    stem = Path(rel_path).stem
+    numero_factura = stem
     for p in ["bonpreu", "digi", "veolia", "catgas"]:
-        if f"_{p}_" in numero_factura.lower():
-            numero_factura = numero_factura.lower().split(f"_{p}_", 1)[1]
+        match = re.split(rf"_{p}_", stem, maxsplit=1, flags=re.IGNORECASE)
+        if len(match) == 2:
+            numero_factura = match[1]
             break
 
     # 1. Eliminar del NAS

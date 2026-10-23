@@ -168,8 +168,6 @@ class ImapMailboxClient:
                             nested_id = f"{msg_id}_{filename or 'nested'}"
                             sub_parsed = self._parse_message(nested_id, sub_msg, sub_sender, sub_subject)
                             nested_emails.append(sub_parsed)
-                            # També afegim directament els seus PDFs a aquest correu
-                            attachments.extend(sub_parsed.attachments)
                             logger.info(
                                 f"Extret correu .eml adjunt: '{sub_subject}' de '{sub_sender}' ({len(sub_parsed.attachments)} PDFs)"
                             )

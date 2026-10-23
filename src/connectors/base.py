@@ -82,32 +82,35 @@ class BaseConnector(ABC):
         metriques: FacturaMetriques,
         origen: str,
     ) -> FacturaResult:
-        """Desa el fitxer PDF al volum NAS i envia les mètriques a InfluxDB."""
+        """Desa el fitxer PDF al volum NAS (si n'hi ha) i envia les mètriques a InfluxDB."""
         any_str = str(metriques.data_emissio.year)
         mes_str = f"{metriques.data_emissio.month:02d}"
         clean_num = metriques.numero_factura.replace("/", "_").replace("\\", "_").replace(" ", "")
         filename = f"{any_str}_{mes_str}_{self.name}_{clean_num}.pdf"
 
-        # Comprovar si ja existeix al NAS
-        ja_existeix = storage.exists(self.tipus.value, self.name, any_str, filename)
-
         pdf_saved_path: str | None = None
         nou_descarregat = False
 
-        if not ja_existeix or settings.DRY_RUN:
-            path = storage.save_pdf(
-                file_bytes=pdf_bytes,
-                tipus=self.tipus.value,
-                proveidor=self.name,
-                any_str=any_str,
-                filename=filename,
-            )
-            pdf_saved_path = str(path)
-            nou_descarregat = True
+        if pdf_bytes:
+            ja_existeix = storage.exists(self.tipus.value, self.name, any_str, filename)
+            if not ja_existeix or settings.DRY_RUN:
+                path = storage.save_pdf(
+                    file_bytes=pdf_bytes,
+                    tipus=self.tipus.value,
+                    proveidor=self.name,
+                    any_str=any_str,
+                    filename=filename,
+                )
+                pdf_saved_path = str(path)
+                nou_descarregat = True
+            else:
+                self.logger.info(f"La factura {filename} ja existeix al NAS Samba. Ometent sobreescriptura.")
+                dest_dir = storage.get_destination_dir(self.tipus.value, self.name, any_str)
+                pdf_saved_path = str(dest_dir / filename)
         else:
-            self.logger.info(f"La factura {filename} ja existeix al NAS Samba. Ometent sobreescriptura.")
-            dest_dir = storage.get_destination_dir(self.tipus.value, self.name, any_str)
-            pdf_saved_path = str(dest_dir / filename)
+            self.logger.info(
+                f"Sense contingut PDF per a {metriques.numero_factura} (origen={origen}). Ometent escriptura al NAS."
+            )
 
         # Enviar mètriques a InfluxDB
         influx_ok = influx_writer.write_factura_metrics(metriques)

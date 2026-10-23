@@ -50,8 +50,9 @@ class StorageManager:
 
     def delete_pdf(self, rel_path: str) -> bool:
         """Elimina un fitxer del NAS Samba de forma segura."""
-        target = (self.base_path / rel_path).resolve()
-        if not str(target).startswith(str(self.base_path.resolve())) or not target.exists():
+        base_resolved = self.base_path.resolve()
+        target = (base_resolved / rel_path).resolve()
+        if not target.is_relative_to(base_resolved) or not target.is_file():
             return False
         if settings.DRY_RUN:
             logger.info(f"[DRY-RUN] S'eliminaria el fitxer a: {target}")

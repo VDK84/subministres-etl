@@ -23,6 +23,7 @@ from src.connectors.base import BaseConnector
 from src.email_client import ImapMailboxClient
 from src.models import FacturaMetriques, FacturaResult, SubministreType
 from src.pdf_parser import (
+    extract_date_range,
     extract_float_value,
     extract_regex_first,
     extract_text_from_pdf_bytes,
@@ -356,17 +357,10 @@ class BonpreuConnector(BaseConnector):
         potencia = extract_float_value(text, r"(?:Pot[èe]ncia\s*contractada|Potencia):?\s*(\d+(?:[.,]\d{1,2})?)\s*kW")
 
         # 6. Període facturat
-        periode_raw = extract_regex_first(
+        dt_inici, dt_fi = extract_date_range(
             text,
-            r"(?:Per[íi]ode\s*facturat|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:a|fins\s*a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+            r"(?:Per[íi]ode\s*facturat|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:a|fins\s*a|al|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         )
-        dt_inici: date | None = None
-        dt_fi: date | None = None
-        if periode_raw:
-            parts = re.split(r"\s*(?:a|fins\s*a|-)\s*", periode_raw)
-            if len(parts) == 2:
-                dt_inici = parse_date_catalan_spanish(parts[0])
-                dt_fi = parse_date_catalan_spanish(parts[1])
 
         # 7. CUPS d'electricitat (ES00...)
         cups = extract_regex_first(text, r"(ES\d{16,20}[A-Za-z]{0,2})")

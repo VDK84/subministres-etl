@@ -1,6 +1,5 @@
 # pyright: reportMissingImports=false
 import logging
-import re
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -22,6 +21,7 @@ from src.connectors.base import BaseConnector
 from src.email_client import ImapMailboxClient
 from src.models import FacturaMetriques, FacturaResult, SubministreType
 from src.pdf_parser import (
+    extract_date_range,
     extract_float_value,
     extract_regex_first,
     extract_text_from_pdf_bytes,
@@ -305,17 +305,10 @@ class DigiConnector(BaseConnector):
             return None
 
         # 4. Període facturat
-        periode_raw = extract_regex_first(
+        dt_inici, dt_fi = extract_date_range(
             text,
             r"(?:Per[íi]odo\s*de\s*facturaci[óo]n|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:al|a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         )
-        dt_inici: date | None = None
-        dt_fi: date | None = None
-        if periode_raw:
-            parts = re.split(r"\s*(?:al|a|-)\s*", periode_raw)
-            if len(parts) == 2:
-                dt_inici = parse_date_catalan_spanish(parts[0])
-                dt_fi = parse_date_catalan_spanish(parts[1])
 
         # 5. Dades addicionals de telefonia
         total_gb = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*GB")
