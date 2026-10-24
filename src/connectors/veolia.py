@@ -328,8 +328,19 @@ class VeoliaConnector(BaseConnector):
                         total=max_dl,
                     )
 
+                    nas_root = Path(settings.NAS_MOUNT_PATH) / self.tipus.value / self.name
+                    existing_files = list(nas_root.glob("**/*.pdf")) if nas_root.exists() else []
+
                     for i, inv_url in enumerate(invoice_urls[:max_dl], start=1):
                         inv_num_hint = inv_url.split("/")[-3] if len(inv_url.split("/")) >= 3 else f"factura_{i}"
+                        if any(inv_num_hint in f.name for f in existing_files):
+                            self.report_progress(
+                                f"⏭️ Factura Veolia {inv_num_hint} ja és al NAS. Ometent ({i}/{max_dl}).",
+                                current=i,
+                                total=max_dl,
+                            )
+                            continue
+
                         self.report_progress(
                             f"⬇️ Accedint a factura {i} de {max_dl} ({inv_num_hint})...",
                             current=i,
@@ -470,6 +481,31 @@ class VeoliaConnector(BaseConnector):
                         "exists_in_nas": ja_al_nas,
                     }
                 )
+
+        # Afegir també les factures que ja tenim al volum NAS (descarregades del portal web)
+        nas_root = Path(settings.NAS_MOUNT_PATH) / self.tipus.value / self.name
+        existing_nums = {str(inv.get("numero", "")).lower() for inv in invoices}
+
+        if nas_root.exists():
+            for pdf_path in sorted(nas_root.glob("**/*.pdf"), reverse=True):
+                stem = pdf_path.stem
+                parts = stem.split(f"_{self.name}_")
+                num = parts[-1] if len(parts) > 1 else stem
+                if num.lower() not in existing_nums:
+                    existing_nums.add(num.lower())
+                    any_folder = pdf_path.parent.name
+                    invoices.append(
+                        {
+                            "id": f"nas_{stem}",
+                            "proveidor": self.name,
+                            "tipus": self.tipus.value,
+                            "data": f"{any_folder}-01-01",
+                            "numero": num,
+                            "import": 0.0,
+                            "subject": f"Factura {num} al NAS",
+                            "exists_in_nas": True,
+                        }
+                    )
         return invoices
 
     def extract_metrics_from_pdf(self, pdf_bytes: bytes) -> FacturaMetriques | None:

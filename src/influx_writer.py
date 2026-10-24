@@ -92,6 +92,17 @@ class InfluxMetricsWriter:
         for k, num in metriques.fields_extra.items():
             point.field(k, float(num))
 
+        # Càlcul automàtic de ràtios unitaris per a Grafana
+        try:
+            if metriques.dies_facturats and metriques.dies_facturats > 0:
+                point.field("cost_diari_eur", round(float(metriques.import_total) / int(metriques.dies_facturats), 4))
+            if metriques.consum_kwh and metriques.consum_kwh > 0:
+                point.field("preu_kwh_real", round(float(metriques.import_total) / float(metriques.consum_kwh), 4))
+            if metriques.consum_m3 and metriques.consum_m3 > 0:
+                point.field("preu_m3_real", round(float(metriques.import_total) / float(metriques.consum_m3), 4))
+        except (ValueError, TypeError, ZeroDivisionError) as err:
+            logger.debug(f"Error calculant ràtios unitaris: {err}")
+
         try:
             with InfluxDBClient(url=self.url, token=self.token, org=self.org) as client:
                 write_api = client.write_api(write_options=SYNCHRONOUS)

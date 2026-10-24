@@ -413,4 +413,29 @@ class DigiConnector(BaseConnector):
                         "exists_in_nas": ja_al_nas,
                     }
                 )
+
+        # Afegir també les factures que ja tenim al volum NAS (descarregades del portal web)
+        nas_root = Path(settings.NAS_MOUNT_PATH) / self.tipus.value / self.name
+        existing_nums = {str(inv.get("numero", "")).lower() for inv in invoices}
+
+        if nas_root.exists():
+            for pdf_path in sorted(nas_root.glob("**/*.pdf"), reverse=True):
+                stem = pdf_path.stem
+                parts = stem.split(f"_{self.name}_")
+                num = parts[-1] if len(parts) > 1 else stem
+                if num.lower() not in existing_nums:
+                    existing_nums.add(num.lower())
+                    any_folder = pdf_path.parent.name
+                    invoices.append(
+                        {
+                            "id": f"nas_{stem}",
+                            "proveidor": self.name,
+                            "tipus": self.tipus.value,
+                            "data": f"{any_folder}-01-01",
+                            "numero": num,
+                            "import": 0.0,
+                            "subject": f"Factura {num} al NAS",
+                            "exists_in_nas": True,
+                        }
+                    )
         return invoices
