@@ -186,10 +186,10 @@ class VeoliaConnector(BaseConnector):
 
                     # 2. Comprovar si estem autenticats o si cal fer login
                     is_authenticated = (
-                        "mis-facturas" in page.url.lower()
-                        and "inicio" not in page.url.lower()
+                        "/group/sgab/" in page.url.lower()
+                        and "login" not in page.url.lower()
                         and page.query_selector(
-                            "a[data-test-id='verDetalleFactura'], a[href*='/misfacturas/view/'], a[data-testid='icon-perfil'], #profile-dialog, #load-mas-facturas"
+                            "a[data-testid='icon-perfil'], #profile-dialog, a[data-test-id='verDetalleFactura']"
                         )
                         is not None
                     )
@@ -241,15 +241,15 @@ class VeoliaConnector(BaseConnector):
                         page.wait_for_timeout(500)
 
                         submit_btn = page.query_selector("button#btn-submit")
-                        if submit_btn and not submit_btn.is_disabled():
-                            submit_btn.click()
-                        else:
-                            page.evaluate(
-                                "() => { const f = document.querySelector('#loginForm'); if (f) f.submit(); }"
-                            )
+                        with page.expect_navigation(wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS):
+                            if submit_btn and not submit_btn.is_disabled():
+                                submit_btn.click()
+                            else:
+                                page.evaluate(
+                                    "() => { const f = document.querySelector('#loginForm'); if (f) f.submit(); }"
+                                )
 
-                        page.wait_for_load_state("domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS)
-                        page.wait_for_timeout(3500)
+                        page.wait_for_timeout(2500)
 
                         # Detecció de 2FA (6 dígits)
                         two_fa_container = page.query_selector("#two-factor-code-inputs, #two-factor-code-1")
@@ -353,7 +353,7 @@ class VeoliaConnector(BaseConnector):
                                 continue
 
                             with page.expect_download(timeout=20000) as download_info:
-                                dl_btn.click()
+                                dl_btn.click(force=True)
                             download = download_info.value
                             path = download.path()
                             if path:
