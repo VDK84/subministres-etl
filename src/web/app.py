@@ -410,7 +410,7 @@ async def index(request: Request):
             "enabled": settings.VEOLIA_ENABLED,
             "icon": "droplet",
             "color": "blue",
-            "strategy": "Email (PDF adjunt)",
+            "strategy": "Trigger Email + Portal Agbar",
             "last_invoice": last_by_provider.get("veolia", "Cap factura trobada"),
         },
         {
@@ -420,7 +420,7 @@ async def index(request: Request):
             "enabled": settings.CATGAS_ENABLED,
             "icon": "flame",
             "color": "amber",
-            "strategy": "Email (PDF adjunt)",
+            "strategy": "Trigger Email + Oficina Virtual",
             "last_invoice": last_by_provider.get("catgas", "Cap factura trobada"),
         },
         {
