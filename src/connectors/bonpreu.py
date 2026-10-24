@@ -375,21 +375,30 @@ class BonpreuConnector(BaseConnector):
         if not text:
             return None
 
-        # 1. Número de factura (ex: Factura núm. 2026E123456)
-        num_factura = extract_regex_first(text, r"(?:Factura\s*n[úu]m\.?|N[úu]mero\s*factura:?)\s*([A-Za-z0-9/_-]+)")
-        if not num_factura:
+        # 1. Número de factura (ex: Número de la factura:\nF26612441 o 2026E123456)
+        num_factura = extract_regex_first(
+            text, r"(?:N[úu]mero\s+(?:de\s+la\s+)?factura:?|Factura\s+n[úu]m\.?:?)\s*\n?\s*([A-Za-z0-9/_-]+)"
+        )
+        if not num_factura or num_factura.lower() == "ero":
+            num_factura = extract_regex_first(text, r"(F\d{7,12})")
+        if not num_factura or num_factura.lower() == "ero":
             num_factura = extract_regex_first(text, r"Factura\s+([0-9]{4}E[0-9]+)")
 
         # 2. Data d'emissió
         data_str = extract_regex_first(
-            text, r"(?:Data\s*emissi[óo]|Fecha\s*emisi[óo]n):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+            text, r"(?:Data\s*(?:d\x27)?emissi[óo]|Fecha\s*emisi[óo]n):?\s*\n?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
         )
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
 
         # 3. Import total
         total_eur = extract_float_value(
-            text, r"(?:Total\s*factura|Import\s*total|Total\s*a\s*pagar):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
+            text,
+            r"(?:Import\s+total\s+de\s+la\s+factura|Total\s*factura|Import\s*total|Total\s*a\s*pagar)[^\d\n]{0,30}\n?\s*(\d{1,4}(?:[.,]\d{1,2})?)\s*€",
         )
+        if total_eur is None:
+            total_eur = extract_float_value(
+                text, r"(?:Total\s*factura|Import\s*total|Total\s*a\s*pagar):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
+            )
         if total_eur is None:
             total_eur = parse_euro_amount(text)
 
@@ -471,4 +480,29 @@ class BonpreuConnector(BaseConnector):
                     "exists_in_nas": ja_al_nas,
                 }
             )
+
+        # Afegir també les factures que ja tenim al volum NAS (ex: descarregades del portal web)
+        nas_root = Path(settings.NAS_MOUNT_PATH) / self.tipus.value / self.name
+        existing_nums = {str(inv.get("numero", "")).lower() for inv in invoices}
+
+        if nas_root.exists():
+            for pdf_path in sorted(nas_root.glob("**/*.pdf"), reverse=True):
+                stem = pdf_path.stem
+                parts = stem.split(f"_{self.name}_")
+                num = parts[-1] if len(parts) > 1 else stem
+                if num.lower() not in existing_nums:
+                    existing_nums.add(num.lower())
+                    any_folder = pdf_path.parent.name
+                    invoices.append(
+                        {
+                            "id": f"nas_{stem}",
+                            "proveidor": self.name,
+                            "tipus": self.tipus.value,
+                            "data": f"{any_folder}-01-01",
+                            "numero": num,
+                            "import": 0.0,
+                            "subject": f"Factura {num} al NAS",
+                            "exists_in_nas": True,
+                        }
+                    )
         return invoices
