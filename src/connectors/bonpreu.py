@@ -123,7 +123,8 @@ class BonpreuConnector(BaseConnector):
                 return results
 
             self.report_progress("🌐 Iniciant descàrrega de factures des del portal de Bonpreu Energia...")
-            pdf_list = self.fetch_invoices_from_portal(imap_client=imap_client, limit=fetch_limit)
+            portal_limit = 1 if mode == "latest" else limit
+            pdf_list = self.fetch_invoices_from_portal(imap_client=imap_client, limit=portal_limit)
             total_dl = len(pdf_list)
             for idx, (pdf_bytes, filename) in enumerate(pdf_list, start=1):
                 self.report_progress(
@@ -284,47 +285,99 @@ class BonpreuConnector(BaseConnector):
                         page.goto(portal_url, wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS)
                         page.wait_for_timeout(4000)
 
-                    # 6. Cerca botons de descàrrega de PDF
-                    page.wait_for_timeout(3000)
-                    download_buttons = page.query_selector_all(
-                        "a[href*='/descarregar'], a[href*='/descargar'], button:has-text('Descarregar'), button:has-text('Descargar'), a[href*='.pdf']"
-                    )
-                    total_found = len(download_buttons)
-                    max_dl = min(limit, total_found) if limit is not None else total_found
-                    self.report_progress(
-                        f"🌐 Trobats {total_found} enllaços de descàrrega a Bonpreu. Iniciant {max_dl}...",
-                        current=0,
-                        total=max_dl,
-                    )
+                    # 6. Cerca botons de descàrrega de PDF amb paginació (SEGÜENT)
+                    from src.storage import storage
 
-                    for i, btn in enumerate(download_buttons[:max_dl], start=1):
+                    has_more = True
+                    page_num = 1
+                    download_count = 0
+
+                    while has_more and page_num <= 5:
+                        self.report_progress(f"🌐 Explorant pàgina {page_num} de factures de Bonpreu...")
+                        page.wait_for_timeout(3000)
+
+                        rows = page.query_selector_all("tr")
+                        candidate_rows = []
+                        for r in rows:
+                            btn = r.query_selector("button:has-text('DESCARREGAR'), button:has-text('DESCARGAR')")
+                            if btn:
+                                candidate_rows.append((r, btn))
+
+                        total_on_page = len(candidate_rows)
+                        if total_on_page == 0:
+                            break
+
                         self.report_progress(
-                            f"⬇️ Descarregant factura {i} de {max_dl} del portal Bonpreu...",
-                            current=i,
-                            total=max_dl,
+                            f"🌐 Trobades {total_on_page} factures a la pàgina {page_num}. Comprovant quines falten al NAS...",
+                            current=0,
+                            total=total_on_page,
                         )
-                        try:
-                            with page.expect_download(timeout=20000) as download_info:
-                                page.evaluate("el => el.click()", btn)
-                            download = download_info.value
-                            path = download.path()
-                            if path:
-                                with open(path, "rb") as f:
-                                    downloaded.append((f.read(), download.suggested_filename or f"bonpreu_{i}.pdf"))
+
+                        for i, (r, btn) in enumerate(candidate_rows, start=1):
+                            tds = r.query_selector_all("td")
+                            num = tds[0].inner_text().strip() if tds else ""
+                            data_str = tds[1].inner_text().strip() if len(tds) > 1 else ""
+                            clean_num = re.sub(r"[^A-Za-z0-9_-]", "", num)
+                            any_clean = re.sub(r"[^0-9]", "", data_str.split("/")[-1]) if "/" in data_str else "2026"
+                            any_str = any_clean if len(any_clean) == 4 else "2026"
+
+                            dest_dir = storage.get_destination_dir(self.tipus.value, self.name, any_str)
+                            ja_al_nas = any(clean_num in f.name for f in dest_dir.glob("*.pdf")) if clean_num else False
+
+                            if ja_al_nas:
                                 self.report_progress(
-                                    f"✅ Factura {i}/{max_dl} descarregada correctament!",
+                                    f"⏭️ Factura Bonpreu {clean_num} ({data_str}) ja és al NAS. Ometent.",
                                     current=i,
-                                    total=max_dl,
+                                    total=total_on_page,
                                 )
-                        except PlaywrightTimeoutError:
+                                continue
+
+                            if limit is not None and download_count >= limit:
+                                has_more = False
+                                break
+
                             self.report_progress(
-                                f"⏱️ Timeout (20s) descarregant factura {i}/{max_dl}. Saltant a la següent...",
+                                f"⬇️ Descarregant factura nova {clean_num} ({data_str}) del portal Bonpreu...",
                                 current=i,
-                                total=max_dl,
-                                status="warning",
+                                total=total_on_page,
                             )
-                        except (PlaywrightError, TimeoutError, OSError) as err:
-                            self.logger.warning(f"No s'ha pogut descarregar el botó {i}: {err}")
+                            try:
+                                with page.expect_download(timeout=20000) as download_info:
+                                    page.evaluate("el => el.click()", btn)
+                                download = download_info.value
+                                path = download.path()
+                                if path:
+                                    with open(path, "rb") as f:
+                                        downloaded.append(
+                                            (f.read(), download.suggested_filename or f"bonpreu_{clean_num}.pdf")
+                                        )
+                                    download_count += 1
+                                    self.report_progress(
+                                        f"✅ Factura {clean_num} descarregada correctament!",
+                                        current=i,
+                                        total=total_on_page,
+                                    )
+                            except PlaywrightTimeoutError:
+                                self.report_progress(
+                                    f"⏱️ Timeout descarregant factura {clean_num}. Saltant...",
+                                    current=i,
+                                    total=total_on_page,
+                                    status="warning",
+                                )
+                            except (PlaywrightError, TimeoutError, OSError) as err:
+                                self.logger.warning(f"No s'ha pogut descarregar el botó {i}: {err}")
+
+                        if limit is not None and download_count >= limit:
+                            break
+
+                        next_btn = page.query_selector("button:has-text('SEGÜENT'), button:has-text('SIGUIENTE')")
+                        if next_btn and not next_btn.is_disabled():
+                            self.report_progress("➡️ Passant a la següent pàgina de factures...")
+                            next_btn.click()
+                            page.wait_for_timeout(3000)
+                            page_num += 1
+                        else:
+                            has_more = False
 
                 except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as page_err:
                     self.record_failure(f"Error de navegació a Bonpreu: {page_err}")
