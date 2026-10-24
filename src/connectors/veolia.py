@@ -309,7 +309,7 @@ class VeoliaConnector(BaseConnector):
                     invoice_urls: list[str] = []
                     for a in detail_links:
                         href = a.get_attribute("href")
-                        if href and "/misfacturas/view/" in href and href not in invoice_urls:
+                        if href and "/misfacturas/view/" in href and href != "#" and href not in invoice_urls:
                             invoice_urls.append(href)
 
                     total_found = len(invoice_urls)
@@ -343,17 +343,13 @@ class VeoliaConnector(BaseConnector):
                             dl_btn = page.query_selector(
                                 "#descargar-factura-digital a, a[onclick*='descargarFacturaPdf'], a:has-text('Descarrega factura digital')"
                             )
-                            if not dl_btn:
-                                self.report_progress(
-                                    f"⚠️ No s'ha trobat botó de descàrrega a la factura {i}/{max_dl}",
-                                    current=i,
-                                    total=max_dl,
-                                    status="warning",
-                                )
-                                continue
-
                             with page.expect_download(timeout=20000) as download_info:
-                                dl_btn.click(force=True)
+                                if dl_btn:
+                                    page.evaluate("el => el.click()", dl_btn)
+                                else:
+                                    page.evaluate(
+                                        "() => { if (typeof ovMisFacturas !== 'undefined' && ovMisFacturas.url) location.href = ovMisFacturas.url.urlDescargarFacturaPdf; }"
+                                    )
                             download = download_info.value
                             path = download.path()
                             if path:
