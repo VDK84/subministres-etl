@@ -164,30 +164,29 @@ class BonpreuConnector(BaseConnector):
         except OSError:
             pass
 
-        portal_url = settings.BONPREU_PORTAL_URL or self.PORTAL_LOGIN_URL
+        portal_url = "https://energia.bonpreuesclat.cat/factures"
         try:
+            self.report_progress("🌐 Iniciant navegador headless Chromium per a Bonpreu...")
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=settings.HEADLESS_BROWSER)
                 try:
                     context_kwargs: dict[str, Any] = {"accept_downloads": True}
                     if session_file.exists():
-                        self.logger.info("Carregant sessió prèvia de Bonpreu des del NAS...")
+                        self.report_progress("🌐 Carregant sessió prèvia de Bonpreu des del NAS...")
                         context_kwargs["storage_state"] = str(session_file)
 
                     context = browser.new_context(**context_kwargs)
                     page = context.new_page()
 
-                    self.logger.info(f"Obrint portal de Bonpreu Energia: {portal_url}")
-                    page.goto(portal_url, timeout=settings.SCRAPER_TIMEOUT_MS)
-                    page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+                    self.report_progress(f"🌐 Obrint portal de factures de Bonpreu ({portal_url})...")
+                    page.goto(portal_url, wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS)
+                    page.wait_for_timeout(3000)
 
-                    # 1. Acceptar cookies si apareix el diàleg d'OneTrust
+                    # 1. Acceptar cookies o eliminar overlay si bloqueja
                     try:
-                        cookie_btn = page.query_selector(
-                            "#accept-recommended-btn-handler, button:has-text('Acceptar-ho tot')"
+                        page.evaluate(
+                            "() => { const el = document.querySelector('#onetrust-consent-sdk'); if (el) el.remove(); }"
                         )
-                        if cookie_btn and cookie_btn.is_visible():
-                            cookie_btn.click()
                     except (PlaywrightError, OSError):
                         pass
 
@@ -195,52 +194,62 @@ class BonpreuConnector(BaseConnector):
                     if (
                         "keycloak" in page.url.lower()
                         or "login" in page.url.lower()
+                        or "protocol/openid" in page.url.lower()
                         or page.query_selector("#kc-form-login")
+                        or page.query_selector("input#username")
                     ):
-                        self.logger.info("Sessió no activa a Bonpreu. Iniciant procés de login a Keycloak...")
+                        self.report_progress(f"🔑 Sessió no activa. Iniciant login per a '{settings.BONPREU_USER}'...")
 
-                        # Omplir formulari de credencials
+                        # Eliminar overlay de cookies abans d'interactuar
+                        page.evaluate(
+                            "() => { const el = document.querySelector('#onetrust-consent-sdk'); if (el) el.remove(); }"
+                        )
+                        page.wait_for_timeout(500)
+
                         page.fill("input#username, input[name='username']", settings.BONPREU_USER or "")
                         page.fill("input#password, input[name='password']", settings.BONPREU_PASSWORD or "")
-                        page.click("button.accedeix, button[type='submit']")
-                        page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+
+                        with page.expect_navigation(wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS):
+                            page.evaluate(
+                                "() => { const f = document.querySelector('#kc-form-login'); if (f) f.submit(); }"
+                            )
+                        page.wait_for_timeout(3000)
 
                         # 3. Detecció de pantalla de 2FA (Verifica la teva identitat / kc-email-totp-code-login-form)
                         is_2fa = (
-                            "email-totp" in page.url.lower()
+                            "totp" in page.url.lower()
+                            or "identitat" in page.title().lower()
                             or page.query_selector("#kc-email-totp-code-login-form") is not None
                             or page.query_selector("input#code") is not None
                         )
 
                         if is_2fa:
-                            self.logger.info("🔐 Bonpreu sol·licita verificació 2FA...")
+                            self.report_progress("🔐 Bonpreu sol·licita codi 2FA per correu...", status="warning")
                             code_to_use = otp_code
 
                             # PLA A: Intentar recuperar el codi 2FA automàticament de la bústia IMAP
                             if not code_to_use and imap_client and imap_client.is_configured():
-                                self.logger.info("Intentant extreure el codi 2FA de la bústia de correu (Pla A)...")
+                                self.report_progress("📧 Cercant codi 2FA de Bonpreu a la bústia de correu...")
                                 code_to_use = self._fetch_otp_code_from_email(imap_client, timeout_seconds=75)
 
                             # Si tenim el codi (automàtic o proporcionat per l'usuari)
                             if code_to_use:
-                                self.logger.info(f"Aplicant codi 2FA a Bonpreu: {code_to_use}")
+                                self.report_progress(f"🔐 Aplicant codi 2FA a Bonpreu: {code_to_use}...")
                                 page.fill("input#code", code_to_use)
-                                page.click(".verify-button, button[type='submit']")
-                                page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+                                with page.expect_navigation(
+                                    wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS
+                                ):
+                                    page.evaluate(
+                                        "() => { const f = document.querySelector('#kc-email-totp-code-login-form'); if (f) f.submit(); }"
+                                    )
+                                page.wait_for_timeout(3500)
                             else:
-                                # PLA B: Fallback / Pendent de 2FA
-                                self.logger.warning(
-                                    "🔐 No s'ha pogut obtenir el codi 2FA automàticament. "
-                                    "Estat: 'Pendent de 2FA'. Pots introduir el codi manualment des de la web."
-                                )
-                                try:
-                                    screenshot_path = session_dir / "bonpreu_2fa_prompt.png"
-                                    page.screenshot(path=str(screenshot_path))
-                                except (OSError, RuntimeError):
-                                    pass
+                                msg = "🔐 Bonpreu requereix codi 2FA enviat per correu. Introdueix-lo o torna a provar."
+                                self.record_failure(msg)
+                                self.report_progress(f"⚠️ {msg}", status="warning")
                                 return downloaded
 
-                    # 4. Si hem superat el login amb èxit, desem la sessió al NAS
+                    # 4. Si hem accedit amb èxit, desem la sessió al NAS
                     if "keycloak" not in page.url.lower():
                         try:
                             context.storage_state(path=str(session_file))
@@ -248,16 +257,15 @@ class BonpreuConnector(BaseConnector):
                         except (OSError, RuntimeError):
                             pass
 
-                    # 5. Navegar a l'apartat de factures si no hi som
+                    # 5. Assegurar que som a la pàgina de factures
                     if "factur" not in page.url.lower():
-                        factura_link = page.query_selector("a[href*='factur'], button:has-text('Factur')")
-                        if factura_link:
-                            factura_link.click()
-                            page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+                        self.report_progress("🌐 Accedint a l'apartat de factures de Bonpreu...")
+                        page.goto(portal_url, wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS)
+                        page.wait_for_timeout(3000)
 
                     # 6. Cerca botons de descàrrega de PDF
                     download_buttons = page.query_selector_all(
-                        "a[href*='.pdf'], button:has-text('Descarregar'), a:has-text('PDF'), button:has-text('PDF')"
+                        "button:has-text('Descarregar pdf'), button:has-text('Descarregar'), a[href*='.pdf'], a:has-text('PDF'), button:has-text('PDF')"
                     )
                     total_found = len(download_buttons)
                     max_dl = min(limit, total_found) if limit is not None else total_found
@@ -274,16 +282,21 @@ class BonpreuConnector(BaseConnector):
                             total=max_dl,
                         )
                         try:
-                            with page.expect_download(timeout=15000) as download_info:
-                                btn.click()
+                            with page.expect_download(timeout=20000) as download_info:
+                                page.evaluate("el => el.click()", btn)
                             download = download_info.value
                             path = download.path()
                             if path:
                                 with open(path, "rb") as f:
                                     downloaded.append((f.read(), download.suggested_filename or f"bonpreu_{i}.pdf"))
+                                self.report_progress(
+                                    f"✅ Factura {i}/{max_dl} descarregada correctament!",
+                                    current=i,
+                                    total=max_dl,
+                                )
                         except PlaywrightTimeoutError:
                             self.report_progress(
-                                f"⏱️ Timeout (15s) descarregant factura {i}/{max_dl}. Saltant a la següent...",
+                                f"⏱️ Timeout (20s) descarregant factura {i}/{max_dl}. Saltant a la següent...",
                                 current=i,
                                 total=max_dl,
                                 status="warning",
@@ -390,7 +403,7 @@ class BonpreuConnector(BaseConnector):
             periode_inici=dt_inici,
             periode_fi=dt_fi,
             dies_facturats=(dt_fi - dt_inici).days if (dt_inici and dt_fi) else None,
-            import_total=float(total_eur),
+            import_total=total_eur,
             consum_kwh=consum_total,
             consum_kwh_punta=p1,
             consum_kwh_pla=p2,
