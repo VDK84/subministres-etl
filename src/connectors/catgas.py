@@ -190,13 +190,9 @@ class CatgasConnector(BaseConnector):
                         pass
 
                     # 2. Comprovar si cal fer login
-                    is_authenticated = (
-                        "factures" in page.url.lower()
-                        and "acceso" not in page.url.lower()
-                        and page.query_selector("button:has-text('GAS'), [role='tab']:has-text('GAS')") is not None
-                    )
+                    needs_login = "acceso" in page.url.lower() or page.query_selector("input#username") is not None
 
-                    if not is_authenticated:
+                    if needs_login:
                         self.report_progress(f"🔑 Sessió no activa. Accedint a login ({self.PORTAL_LOGIN_URL})...")
                         page.goto(
                             self.PORTAL_LOGIN_URL,
@@ -244,10 +240,12 @@ class CatgasConnector(BaseConnector):
 
                     # 4. Assegurar que som a la pestanya GAS
                     self.report_progress("🔥 Seleccionant pestanya de factures de GAS...")
-                    gas_tab = page.query_selector("button:has-text('GAS'), [role='tab']:has-text('GAS')")
+                    gas_tab = page.wait_for_selector(
+                        "button:has-text('GAS'), [role='tab']:has-text('GAS')", timeout=15000
+                    )
                     if gas_tab:
                         gas_tab.click()
-                        page.wait_for_timeout(3000)
+                        page.wait_for_timeout(2500)
 
                     # 5. Cercar files de la taula de gas
                     from src.storage import storage
@@ -392,6 +390,31 @@ class CatgasConnector(BaseConnector):
                         "exists_in_nas": ja_al_nas,
                     }
                 )
+
+        # Afegir també les factures que ja tenim al volum NAS (ex: descarregades del portal web)
+        nas_root = Path(settings.NAS_MOUNT_PATH) / self.tipus.value / self.name
+        existing_nums = {str(inv.get("numero", "")).lower() for inv in invoices}
+
+        if nas_root.exists():
+            for pdf_path in sorted(nas_root.glob("**/*.pdf"), reverse=True):
+                stem = pdf_path.stem
+                parts = stem.split(f"_{self.name}_")
+                num = parts[-1] if len(parts) > 1 else stem
+                if num.lower() not in existing_nums:
+                    existing_nums.add(num.lower())
+                    any_folder = pdf_path.parent.name
+                    invoices.append(
+                        {
+                            "id": f"nas_{stem}",
+                            "proveidor": self.name,
+                            "tipus": self.tipus.value,
+                            "data": f"{any_folder}-01-01",
+                            "numero": num,
+                            "import": 0.0,
+                            "subject": f"Factura {num} al NAS",
+                            "exists_in_nas": True,
+                        }
+                    )
         return invoices
 
     def extract_metrics_from_pdf(self, pdf_bytes: bytes) -> FacturaMetriques | None:
