@@ -120,7 +120,8 @@ class CatgasConnector(BaseConnector):
                 return results
 
             self.report_progress("🌐 Iniciant descàrrega de factures des de l'Oficina Virtual de Catgas...")
-            pdf_list = self.fetch_invoices_from_portal(limit=fetch_limit)
+            portal_limit = 1 if mode == "latest" else limit
+            pdf_list = self.fetch_invoices_from_portal(limit=portal_limit)
             total_dl = len(pdf_list)
             for idx, (pdf_bytes, filename) in enumerate(pdf_list, start=1):
                 self.report_progress(
@@ -248,13 +249,17 @@ class CatgasConnector(BaseConnector):
                         gas_tab.click()
                         page.wait_for_timeout(3000)
 
-                    # 5. Cercar botons de descàrrega de PDF
-                    dl_buttons = page.query_selector_all(
-                        "button:has-text('DESCARREGAR PDF'), button:has-text('DESCARGAR PDF')"
-                    )
-                    total_found = len(dl_buttons)
-                    max_dl = min(limit, total_found) if limit is not None else total_found
+                    # 5. Cercar files de la taula de gas
+                    from src.storage import storage
 
+                    rows = page.query_selector_all("tr.MuiTableRow-root, tr")
+                    candidate_rows = []
+                    for r in rows:
+                        btn = r.query_selector("button:has-text('DESCARREGAR'), button:has-text('DESCARGAR')")
+                        if btn:
+                            candidate_rows.append((r, btn))
+
+                    total_found = len(candidate_rows)
                     if total_found == 0:
                         self.report_progress(
                             "⚠️ Connectat a l'Oficina Virtual de Catgas, però s'han trobat 0 botons de descàrrega de gas.",
@@ -263,16 +268,37 @@ class CatgasConnector(BaseConnector):
                         return downloaded
 
                     self.report_progress(
-                        f"🌐 Trobades {total_found} factures de gas al portal. Iniciant descàrrega de {max_dl}...",
+                        f"🌐 Trobades {total_found} factures de gas al portal. Comprovant quines falten al NAS...",
                         current=0,
-                        total=max_dl,
+                        total=total_found,
                     )
 
-                    for i, btn in enumerate(dl_buttons[:max_dl], start=1):
+                    download_count = 0
+                    for i, (r, btn) in enumerate(candidate_rows, start=1):
+                        tds = r.query_selector_all("td")
+                        num = tds[0].inner_text().strip() if tds else ""
+                        data_str = tds[1].inner_text().strip() if len(tds) > 1 else ""
+                        clean_num = re.sub(r"[^A-Za-z0-9_-]", "", num)
+                        any_clean = re.sub(r"[^0-9]", "", data_str.split("/")[-1]) if "/" in data_str else "2026"
+                        any_str = any_clean if len(any_clean) == 4 else "2026"
+                        dest_dir = storage.get_destination_dir(self.tipus.value, self.name, any_str)
+                        ja_al_nas = any(clean_num in f.name for f in dest_dir.glob("*.pdf")) if clean_num else False
+
+                        if ja_al_nas:
+                            self.report_progress(
+                                f"⏭️ Factura Catgas {clean_num} ({data_str}) ja existeix al NAS. Ometent.",
+                                current=i,
+                                total=total_found,
+                            )
+                            continue
+
+                        if limit is not None and download_count >= limit:
+                            break
+
                         self.report_progress(
-                            f"⬇️ Descarregant factura de gas {i} de {max_dl} des de Catgas...",
+                            f"⬇️ Descarregant factura de gas que falta: {clean_num} ({data_str})...",
                             current=i,
-                            total=max_dl,
+                            total=total_found,
                         )
                         try:
                             with page.expect_download(timeout=20000) as download_info:
@@ -282,22 +308,23 @@ class CatgasConnector(BaseConnector):
                             if path:
                                 with open(path, "rb") as f:
                                     downloaded.append(
-                                        (f.read(), download.suggested_filename or f"catgas_factura_{i}.pdf")
+                                        (f.read(), download.suggested_filename or f"catgas_{clean_num}.pdf")
                                     )
+                                download_count += 1
                                 self.report_progress(
-                                    f"✅ Factura {i}/{max_dl} descarregada correctament!",
+                                    f"✅ Factura {clean_num} descarregada correctament!",
                                     current=i,
-                                    total=max_dl,
+                                    total=total_found,
                                 )
                         except PlaywrightTimeoutError:
                             self.report_progress(
-                                f"⏱️ Timeout (20s) esperant la descàrrega de la factura {i}/{max_dl}. Saltant a la següent...",
+                                f"⏱️ Timeout (20s) esperant la descàrrega de la factura {clean_num}. Saltant...",
                                 current=i,
-                                total=max_dl,
+                                total=total_found,
                                 status="warning",
                             )
                         except (PlaywrightError, TimeoutError, OSError) as err:
-                            self.logger.warning(f"Error en factura Catgas {i}/{max_dl}: {err}")
+                            self.logger.warning(f"Error en factura Catgas {clean_num}: {err}")
 
                 except PlaywrightTimeoutError as t_err:
                     msg = f"⏱️ Timeout carregant l'Oficina Virtual de Catgas: {t_err}"
@@ -422,7 +449,7 @@ class CatgasConnector(BaseConnector):
             periode_inici=dt_inici,
             periode_fi=dt_fi,
             dies_facturats=(dt_fi - dt_inici).days if (dt_inici and dt_fi) else None,
-            import_total=float(total_eur),
+            import_total=total_eur,
             consum_kwh=consum_kwh,
             consum_m3=consum_m3,
             cups_o_referencia=cups,
