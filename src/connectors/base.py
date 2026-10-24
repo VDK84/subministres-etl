@@ -1,6 +1,7 @@
 # pyright: reportMissingImports=false
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -23,6 +24,33 @@ class BaseConnector(ABC):
         self.logger = logging.getLogger(f"connector.{self.name}")
         self.consecutive_failures: int = 0
         self.cooldown_until: datetime | None = None
+        self.progress_callback: Callable[[dict[str, Any]], None] | None = None
+
+    def report_progress(
+        self,
+        step: str,
+        current: int = 0,
+        total: int = 0,
+        status: str = "running",
+    ) -> None:
+        """Emet l'estat i el progrés exacte (ex: 3/40) cap a la UI per WebSocket i al log."""
+        pct = int((current / total) * 100) if total > 0 else 0
+        counter_str = f"[{current}/{total}] " if total > 0 else ""
+        self.logger.info(f"[{self.name.upper()}] {counter_str}{step}")
+        if self.progress_callback:
+            try:
+                self.progress_callback(
+                    {
+                        "connector": self.name.upper(),
+                        "step": step,
+                        "current": current,
+                        "total": total,
+                        "percent": pct,
+                        "status": status,
+                    }
+                )
+            except (TypeError, ValueError, RuntimeError, OSError) as e:
+                self.logger.debug(f"Error progress callback: {e}")
 
     def is_in_cooldown(self) -> bool:
         """Comprova si el connector està en pausa preventiva de seguretat."""
@@ -63,6 +91,7 @@ class BaseConnector(ABC):
         imap_client: ImapMailboxClient,
         mode: str = "normal",
         limit: int | None = None,
+        source: str = "auto",
     ) -> list[FacturaResult]:
         """Executa l'ETL per a aquest connector: descàrrega, parseig, emmagatzematge i ingesta.
 
@@ -70,6 +99,11 @@ class BaseConnector(ABC):
           - "normal": processament segons configuració (days_back per defecte)
           - "latest": cerca exclusivament l'última factura disponible
           - "all": cerca tot l'històric disponible
+
+        Fonts (source) admeses:
+          - "auto": cerca híbrida (bústia IMAP i portal web si cal)
+          - "email": cerca exclusivament als correus rebuts per IMAP
+          - "portal": descàrrega exclusivament des del portal web amb Playwright
         """
 
     def fetch_available_invoices(self, imap_client: ImapMailboxClient) -> list[dict[str, Any]]:

@@ -62,79 +62,81 @@ class BonpreuConnector(BaseConnector):
         imap_client: ImapMailboxClient,
         mode: str = "normal",
         limit: int | None = None,
+        source: str = "auto",
     ) -> list[FacturaResult]:
         results: list[FacturaResult] = []
         if not self.is_enabled():
+            self.report_progress("Connector Bonpreu desactivat per configuració.", status="warning")
             return results
 
         if self.is_in_cooldown():
             return results
 
-        fetch_limit = 1 if mode == "latest" else (limit or (None if mode == "all" else 3))
-        self.logger.info(f"Executant connector Bonpreu Esclat Energia (mode={mode}, limit={fetch_limit})...")
-
-        # 1. Analitzar correus d'avís de factura
         days_back = 730 if mode == "all" else settings.DAYS_BACK
-        emails = imap_client.fetch_recent_emails(
-            sender_filters=list(self.EMAIL_SENDERS),
-            days_back=days_back,
-        )
-        self.logger.info(f"Trobats {len(emails)} correus d'avís de Bonpreu Energia")
+        fetch_limit = 1 if mode == "latest" else (limit if limit is not None else (None if mode == "all" else 3))
 
-        trobat_avis = False
-        import_avis: float | None = None
-        data_avis: date | None = None
-
-        for em in emails:
-            trobat_avis = True
-            parsed_amt = parse_euro_amount(em.body_text) or parse_euro_amount(em.subject)
-            if parsed_amt is not None and import_avis is None:
-                import_avis = parsed_amt
-            if em.date and data_avis is None:
-                data_avis = em.date.date()
-
-            # Comprovació de seguretat: si per cas un dia Bonpreu adjunta el PDF directament
-            for att in em.attachments:
-                if att.filename.lower().endswith(".pdf"):
-                    self.logger.info(f"Detectat PDF adjunt directament a correu Bonpreu: {att.filename}")
-                    metriques = self.extract_metrics_from_pdf(att.data)
-                    if metriques:
-                        res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
-                        results.append(res)
-                        if mode == "latest":
-                            return results
-
-        if results:
-            return results
-
-        # 2. Si no hi ha PDF adjunt per correu, procedim a la descàrrega des del portal de clients
-        if not settings.BONPREU_USER or not settings.BONPREU_PASSWORD:
-            self.logger.warning(
-                "Credencials de portal Bonpreu (BONPREU_USER / BONPREU_PASSWORD) no definides. "
-                "No es pot fer scraping del portal per obtenir el PDF."
+        # 1. Extracció via Email (IMAP)
+        if source in ("auto", "email"):
+            self.report_progress(f"📧 Connectant a bústia IMAP per Bonpreu (últims {days_back} dies)...")
+            emails = imap_client.fetch_recent_emails(
+                sender_filters=list(self.EMAIL_SENDERS),
+                days_back=days_back,
             )
-            if trobat_avis and import_avis is not None:
-                data_final = data_avis or date.today()
-                metriques_avis = FacturaMetriques(
-                    proveidor=self.name,
-                    tipus=self.tipus,
-                    numero_factura=f"BONPREU-AVIS-{data_final.strftime('%Y%m')}",
-                    data_emissio=data_final,
-                    import_total=import_avis,
-                )
-                influx_ok = self.save_and_ingest(b"", metriques_avis, origen="email_notification")
-                results.append(influx_ok)
-            return results
+            emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
 
-        self.logger.info("Iniciant descàrrega de factures des del portal de Bonpreu Energia...")
-        pdf_list = self.fetch_invoices_from_portal(imap_client=imap_client, limit=fetch_limit)
-        for pdf_bytes, filename in pdf_list:
-            metriques = self.extract_metrics_from_pdf(pdf_bytes)
-            if metriques:
-                res = self.save_and_ingest(pdf_bytes, metriques, origen="web_portal_scraping")
-                results.append(res)
-                if mode == "latest":
-                    return results
+            pdf_attachments = [
+                (em, att) for em in emails for att in em.attachments if att.filename.lower().endswith(".pdf")
+            ]
+            if fetch_limit:
+                pdf_attachments = pdf_attachments[:fetch_limit]
+
+            total_pdfs = len(pdf_attachments)
+            self.report_progress(
+                f"📧 Trobats {len(emails)} correus d'avís i {total_pdfs} factures PDF adjuntes.",
+                current=0,
+                total=total_pdfs,
+            )
+
+            for idx, (em, att) in enumerate(pdf_attachments, start=1):
+                self.report_progress(
+                    f"📧 Processant PDF adjunt Bonpreu ({att.filename})...",
+                    current=idx,
+                    total=total_pdfs,
+                )
+                metriques = self.extract_metrics_from_pdf(att.data)
+                if metriques:
+                    res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
+                    results.append(res)
+
+            if source == "email":
+                return results
+            if results and mode != "all":
+                return results
+
+        # 2. Descàrrega des del portal de clients amb Playwright
+        if source in ("auto", "portal"):
+            if not settings.BONPREU_USER or not settings.BONPREU_PASSWORD:
+                msg = "❌ Faltan credencials BONPREU_USER / BONPREU_PASSWORD al Secret per entrar al portal web."
+                self.report_progress(msg, status="error")
+                if source == "portal":
+                    raise RuntimeError(msg)
+                return results
+
+            self.report_progress("🌐 Iniciant descàrrega de factures des del portal de Bonpreu Energia...")
+            pdf_list = self.fetch_invoices_from_portal(imap_client=imap_client, limit=fetch_limit)
+            total_dl = len(pdf_list)
+            for idx, (pdf_bytes, filename) in enumerate(pdf_list, start=1):
+                self.report_progress(
+                    f"💾 Analitzant i desant factura {filename} al NAS i InfluxDB...",
+                    current=idx,
+                    total=total_dl,
+                )
+                metriques = self.extract_metrics_from_pdf(pdf_bytes)
+                if metriques:
+                    res = self.save_and_ingest(pdf_bytes, metriques, origen="web_portal_scraping")
+                    results.append(res)
+                    if mode == "latest":
+                        return results
 
         return results
 
@@ -257,12 +259,20 @@ class BonpreuConnector(BaseConnector):
                     download_buttons = page.query_selector_all(
                         "a[href*='.pdf'], button:has-text('Descarregar'), a:has-text('PDF'), button:has-text('PDF')"
                     )
-                    max_dl = limit or 3
-                    self.logger.info(
-                        f"Trobats {len(download_buttons)} enllaços de descàrrega de factura (límit: {max_dl})"
+                    total_found = len(download_buttons)
+                    max_dl = min(limit, total_found) if limit is not None else total_found
+                    self.report_progress(
+                        f"🌐 Trobats {total_found} enllaços de descàrrega a Bonpreu. Iniciant {max_dl}...",
+                        current=0,
+                        total=max_dl,
                     )
 
-                    for i, btn in enumerate(download_buttons[:max_dl]):
+                    for i, btn in enumerate(download_buttons[:max_dl], start=1):
+                        self.report_progress(
+                            f"⬇️ Descarregant factura {i} de {max_dl} del portal Bonpreu...",
+                            current=i,
+                            total=max_dl,
+                        )
                         try:
                             with page.expect_download(timeout=15000) as download_info:
                                 btn.click()
@@ -271,7 +281,14 @@ class BonpreuConnector(BaseConnector):
                             if path:
                                 with open(path, "rb") as f:
                                     downloaded.append((f.read(), download.suggested_filename or f"bonpreu_{i}.pdf"))
-                        except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError) as err:
+                        except PlaywrightTimeoutError:
+                            self.report_progress(
+                                f"⏱️ Timeout (15s) descarregant factura {i}/{max_dl}. Saltant a la següent...",
+                                current=i,
+                                total=max_dl,
+                                status="warning",
+                            )
+                        except (PlaywrightError, TimeoutError, OSError) as err:
                             self.logger.warning(f"No s'ha pogut descarregar el botó {i}: {err}")
 
                 except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as page_err:

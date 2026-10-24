@@ -38,41 +38,60 @@ class CatgasConnector(BaseConnector):
         imap_client: ImapMailboxClient,
         mode: str = "normal",
         limit: int | None = None,
+        source: str = "auto",
     ) -> list[FacturaResult]:
         results: list[FacturaResult] = []
         if not self.is_enabled():
+            self.report_progress("Connector Catgas desactivat per configuració.", status="warning")
             return results
 
+        if source == "portal":
+            self.report_progress(
+                "⚠️ Catgas només rep factures per Correu IMAP (no disposa de scraper web). Cercant al correu...",
+                status="warning",
+            )
+
         days_back = 730 if mode == "all" else settings.DAYS_BACK
-        self.logger.info(f"Executant connector Catgas (Gas natural, mode={mode})...")
+        self.report_progress(f"📧 Connectant a bústia IMAP per Catgas (últims {days_back} dies)...")
 
         emails = imap_client.fetch_recent_emails(
             sender_filters=list(self.EMAIL_SENDERS),
             days_back=days_back,
         )
-        self.logger.info(f"Trobats {len(emails)} correus potencials de Catgas")
-
-        # Ordenar els correus del més recent al més antic
         emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
 
-        for em in emails:
-            for att in em.attachments:
-                if not att.filename.lower().endswith(".pdf"):
-                    continue
+        pdf_attachments = [
+            (em, att) for em in emails for att in em.attachments if att.filename.lower().endswith(".pdf")
+        ]
+        fetch_limit = 1 if mode == "latest" else (limit if limit is not None else (None if mode == "all" else 3))
+        if fetch_limit:
+            pdf_attachments = pdf_attachments[:fetch_limit]
 
-                self.logger.info(f"Processant fitxer adjunt de Catgas: {att.filename} de '{em.subject}'")
-                metriques = self.extract_metrics_from_pdf(att.data)
-                if not metriques:
-                    metriques = self._fallback_metrics(att.data, em.date.date() if em.date else date.today())
+        total_pdfs = len(pdf_attachments)
+        self.report_progress(
+            f"📧 Trobats {len(emails)} correus i {total_pdfs} factures PDF adjuntes.",
+            current=0,
+            total=total_pdfs,
+        )
 
-                if metriques:
-                    res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
-                    results.append(res)
+        for idx, (em, att) in enumerate(pdf_attachments, start=1):
+            self.report_progress(
+                f"📧 Processant factura Catgas {idx}/{total_pdfs}: {att.filename}",
+                current=idx,
+                total=total_pdfs,
+            )
+            metriques = self.extract_metrics_from_pdf(att.data)
+            if not metriques:
+                metriques = self._fallback_metrics(att.data, em.date.date() if em.date else date.today())
 
-                    if mode == "latest":
-                        return results
-                    if limit and len(results) >= limit:
-                        return results
+            if metriques:
+                res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
+                results.append(res)
+
+                if mode == "latest":
+                    return results
+                if limit and len(results) >= limit:
+                    return results
 
         return results
 

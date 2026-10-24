@@ -77,6 +77,20 @@ class ConnectionManager:
             except (WebSocketDisconnect, ConnectionResetError, OSError):
                 self.disconnect(ws)
 
+    async def broadcast_status(self, payload: dict[str, Any]) -> None:
+        for ws in list(self.active_connections):
+            try:
+                await ws.send_json({"type": "status", **payload})
+            except (WebSocketDisconnect, ConnectionResetError, OSError):
+                self.disconnect(ws)
+
+    async def broadcast_progress(self, payload: dict[str, Any]) -> None:
+        for ws in list(self.active_connections):
+            try:
+                await ws.send_json({"type": "progress", **payload})
+            except (WebSocketDisconnect, ConnectionResetError, OSError):
+                self.disconnect(ws)
+
 
 ws_manager = ConnectionManager()
 
@@ -93,9 +107,11 @@ class WebLogHandler(logging.Handler):
             return
 
 
+root_logger = logging.getLogger()
+root_logger.setLevel(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
 web_handler = WebLogHandler()
 web_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] (%(name)s) %(message)s", "%H:%M:%S"))
-logging.getLogger().addHandler(web_handler)
+root_logger.addHandler(web_handler)
 
 
 # Silenciar el polling continu de /api/logs dels access logs d'Uvicorn
@@ -295,12 +311,17 @@ def run_sync_task(
     connector_name: str | None = None,
     mode: str = "normal",
     limit: int | None = None,
+    source: str = "auto",
 ) -> None:
-    """Tasca d'execució d'ETL llançada en segon pla."""
+    """Tasca d'execució d'ETL amb emissió de progrés (X/N) i diagnòstic en temps real."""
+    source_label = {"email": "📧 Correu IMAP", "portal": "🌐 Portal Web", "auto": "⚡ Híbrid"}.get(source, source)
     execution_state["is_running"] = True
-    execution_state["active_connector"] = f"{connector_name or 'Tots'} ({mode})"
+    execution_state["active_connector"] = f"{(connector_name or 'Tots').upper()} ({source_label})"
     execution_state["last_status"] = "Sincronitzant..."
-    logger.info(f"Iniciant sincronització sota demanda: {execution_state['active_connector']}")
+
+    def _emit_progress(data: dict[str, Any]) -> None:
+        if main_loop and main_loop.is_running():
+            asyncio.run_coroutine_threadsafe(ws_manager.broadcast_progress(data), main_loop)
 
     connectors_map = get_all_connectors_map()
     if connector_name and connector_name.lower() in connectors_map:
@@ -309,26 +330,64 @@ def run_sync_task(
         to_run = [c for c in connectors_map.values() if c.is_enabled()]
 
     results: list[FacturaResult] = []
-    has_errors = False
+    error_messages: list[str] = []
 
     for conn in to_run:
-        logger.info(f"Executant connector: {conn.name.upper()} (mode={mode})")
+        conn.progress_callback = _emit_progress
         try:
-            res = conn.run(imap_client, mode=mode, limit=limit)
+            _emit_progress(
+                {
+                    "connector": conn.name.upper(),
+                    "step": f"Iniciant extracció ({source_label})...",
+                    "current": 0,
+                    "total": 0,
+                    "percent": 0,
+                    "status": "running",
+                }
+            )
+            res = conn.run(imap_client, mode=mode, limit=limit, source=source)
             results.extend(res)
             for r in res:
                 if r.errors:
-                    has_errors = True
+                    error_messages.extend(r.errors)
         except (OSError, RuntimeError, ValueError) as err:
-            logger.error(f"Error executant connector {conn.name}: {err}")
-            has_errors = True
+            err_str = f"{conn.name.upper()}: {err}"
+            logger.error(f"❌ Error executant {err_str}")
+            error_messages.append(err_str)
+        finally:
+            conn.progress_callback = None
+
+    noves = sum(1 for r in results if r.nou_descarregat)
+    existents = len(results) - noves
 
     execution_state["is_running"] = False
     execution_state["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    execution_state["last_status"] = "Error" if has_errors else "Completat"
+    execution_state["last_status"] = "Error" if error_messages else "Completat"
     execution_state["last_results"] = [r.model_dump() for r in results]
     execution_state["active_connector"] = None
-    logger.info(f"Sincronització finalitzada amb estat: {execution_state['last_status']}")
+
+    if error_messages:
+        summary_msg = f"❌ Finalitzat amb errors ({source_label}): {'; '.join(error_messages)}"
+        status_code = "error"
+    elif len(results) == 0:
+        summary_msg = (
+            f"⚠️ Procés finalitzat ({source_label}): 0 factures obtingudes. "
+            "Revisa la consola de logs inferior per veure el detall."
+        )
+        status_code = "warning"
+    else:
+        summary_msg = (
+            f"✅ Completat ({source_label}): {len(results)} factures processades "
+            f"({noves} noves desades al NAS, {existents} ja existents)."
+        )
+        status_code = "ok"
+
+    logger.info(summary_msg)
+    if main_loop and main_loop.is_running():
+        asyncio.run_coroutine_threadsafe(
+            ws_manager.broadcast_status({"status": status_code, "message": summary_msg, "new_count": noves}),
+            main_loop,
+        )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -405,40 +464,55 @@ async def trigger_sync(
     background_tasks: BackgroundTasks,
     connector: str = Form(default=""),
     mode: str = Form(default="normal"),
+    source: str = Form(default="auto"),
 ):
-    """Dispara la sincronització en segon pla."""
+    """Dispara la sincronització en segon pla podent triar source ('email', 'portal' o 'auto')."""
     if execution_state["is_running"]:
         return HTMLResponse(
-            '<div class="p-4 mb-4 text-sm text-yellow-800 rounded-lg bg-yellow-50 dark:bg-gray-800 dark:text-yellow-300" role="alert">'
-            "Ja hi ha una sincronització en curs. Si us plau, espera que finalitzi.</div>"
+            '<div class="p-4 mb-4 text-sm text-yellow-300 rounded-xl bg-yellow-950/60 border border-yellow-700/50">'
+            "⚠️ Ja hi ha una sincronització en curs. Mira el panell de progrés superior.</div>"
         )
 
     target = connector.strip() if connector else None
     sync_mode = mode.strip() if mode else "normal"
-    background_tasks.add_task(run_sync_task, target, mode=sync_mode)
+    sync_source = source.strip() if source else "auto"
+    limit = 1 if sync_mode == "latest" else None
 
-    target_escaped = html.escape(target.upper()) if target else None
-    target_desc = f"del proveïdor {target_escaped}" if target_escaped else "de tots els proveïdors"
-    mode_desc = "històrica completa (730 dies)" if sync_mode == "all" else "ordinària"
+    background_tasks.add_task(run_sync_task, target, mode=sync_mode, limit=limit, source=sync_source)
+
+    target_escaped = html.escape(target.upper()) if target else "TOTS ELS PROVEÏDORS"
+    source_desc = {"email": "📧 Correu IMAP", "portal": "🌐 Portal Web", "auto": "⚡ Automàtic"}.get(
+        sync_source, sync_source
+    )
     return HTMLResponse(
-        f'<div class="p-4 mb-4 text-sm text-green-800 rounded-lg bg-green-50 dark:bg-gray-800 dark:text-green-400" role="alert">'
-        f"🚀 Sincronització {mode_desc} iniciada {target_desc} en segon pla. Els logs s'estan actualitzant a continuació.</div>"
+        f'<div class="p-4 mb-4 rounded-xl bg-slate-900 border border-blue-700/60 shadow-lg space-y-2">'
+        f'  <div class="flex items-center justify-between text-xs font-semibold text-blue-300">'
+        f'    <span id="live-progress-title">⏳ {target_escaped} ({source_desc}) — Iniciant...</span>'
+        f'    <span id="live-progress-counter" class="font-mono text-emerald-400">Connectant...</span>'
+        f"  </div>"
+        f'  <div class="w-full bg-slate-800 rounded-full h-2 overflow-hidden">'
+        f'    <div id="live-progress-bar" class="bg-emerald-500 h-2 rounded-full transition-all duration-300 animate-pulse" style="width: 10%"></div>'
+        f"  </div>"
+        f'  <p id="live-progress-step" class="text-xs text-slate-300 font-mono truncate">Esperant resposta del connector...</p>'
+        f"</div>"
     )
 
 
 @app.websocket("/ws/logs")
 async def websocket_logs_endpoint(websocket: WebSocket):
-    """Canal WebSocket bidireccional per transmetre logs en temps real i sincronització de versió."""
+    """Canal WebSocket amb heartbeat automàtic per transmetre logs, progrés X/N i estat."""
     await ws_manager.connect(websocket)
     try:
         # 1. Enviar la versió actual del servidor per al version-check del frontend
         await websocket.send_json({"type": "version", "version": f"v{settings.APP_VERSION}"})
         # 2. Enviar els darrers logs acumulats per a la càrrega inicial
-        for line in list(log_buffer)[-40:]:
+        for line in list(log_buffer)[-60:]:
             await websocket.send_json({"type": "log", "line": line})
         while True:
-            # Manté la connexió oberta
-            await websocket.receive_text()
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
+            except TimeoutError:
+                await websocket.send_json({"type": "ping"})
     except (WebSocketDisconnect, ConnectionResetError, OSError):
         ws_manager.disconnect(websocket)
 
