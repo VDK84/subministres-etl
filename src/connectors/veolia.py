@@ -339,9 +339,9 @@ class VeoliaConnector(BaseConnector):
                             page.goto(inv_url, wait_until="domcontentloaded", timeout=20000)
                             page.wait_for_timeout(1500)
 
-                            # A la pàgina de detall, el botó oficial de descàrrega és #descargar-factura-digital a
+                            # A la pàgina de detall, el botó oficial de descàrrega és exclusivament #descargar-factura-digital a o a[onclick*='descargarFacturaPdf']
                             dl_btn = page.query_selector(
-                                "#descargar-factura-digital a, a[onclick*='descargarFacturaPdf'], a:has-text('Descarrega factura digital')"
+                                "#descargar-factura-digital a, a[onclick*='descargarFacturaPdf']"
                             )
                             with page.expect_download(timeout=20000) as download_info:
                                 if dl_btn:
