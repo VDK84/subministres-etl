@@ -238,15 +238,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && playwright install --with-deps chromium \
-    && mkdir -p /data/factures && chmod 777 /data/factures
+    && apt-get purge -y --auto-remove gcc libffi-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Crear usuari no-root per seguretat (Principle of Least Privilege)
+RUN groupadd -r -g 1000 appuser && \
+    useradd -r -u 1000 -g appuser -d /app -s /sbin/nologin appuser && \
+    mkdir -p /data/factures /ms-playwright && \
+    chown -R appuser:appuser /app /data /ms-playwright
 
 # Copiar el codi de l'aplicació
-COPY src/ ./src
+COPY --chown=appuser:appuser src/ ./src
 ENV PYTHONPATH=/app
 
 # Versió SemVer injectada durant el build
-ARG APP_VERSION=0.6.0
+ARG APP_VERSION=0.15.0
 ENV APP_VERSION=${APP_VERSION}
+
+USER appuser
 
 EXPOSE 8000
 
@@ -262,8 +271,8 @@ description: >-
   Helm chart per a l'ETL de factures de subministraments
   (Aigua, Gas, Llum, Telefonia) a K3s.
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.15.0
+appVersion: "0.15.0"
 
 
 FITXER: ./helm/subministres-etl/templates/configmap.yaml
@@ -311,6 +320,7 @@ spec:
             - name: {{ .Chart.Name }}
               image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
               imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["subministres-etl"]
               {{- if .Values.args }}
               args:
                 {{- toYaml .Values.args | nindent 16 }}
@@ -595,7 +605,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "subministres-etl"
-version = "0.3.3"
+version = "0.15.0"
 description = "ETL i interfície web de gestió de factures de subministraments (Aigua, Gas, Llum, Telefonia) per desar a NAS i InfluxDB"
 authors = [{ name = "VDK84" }]
 readme = "README.md"
@@ -604,15 +614,11 @@ dependencies = [
     "influxdb-client>=1.38.0",
     "playwright>=1.47.0",
     "pypdf>=4.3.0",
-    "pdfplumber>=0.11.0",
     "pydantic>=2.7.0",
     "pydantic-settings>=2.2.0",
-    "pyyaml>=6.0.1",
     "requests>=2.31.0",
-    "beautifulsoup4>=4.12.3",
     "rich>=13.7.1",
     "python-dateutil>=2.9.0",
-    "tenacity>=8.3.0",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.28.0",
     "jinja2>=3.1.3",
@@ -646,15 +652,11 @@ FITXER: ./requirements.txt
 influxdb-client>=1.38.0
 playwright>=1.47.0
 pypdf>=4.3.0
-pdfplumber>=0.11.0
 pydantic>=2.7.0
 pydantic-settings>=2.2.0
-pyyaml>=6.0.1
 requests>=2.31.0
-beautifulsoup4>=4.12.3
 rich>=13.7.1
 python-dateutil>=2.9.0
-tenacity>=8.3.0
 fastapi>=0.110.0
 uvicorn[standard]>=0.28.0
 jinja2>=3.1.3
@@ -684,7 +686,7 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = Field(default="INFO")
     DRY_RUN: bool = Field(default=False)
     DAYS_BACK: int = Field(default=60, description="Dies enrere per buscar correus o factures")
-    APP_VERSION: str = Field(default="0.3.3", description="Versió de l'aplicació")
+    APP_VERSION: str = Field(default="0.15.0", description="Versió de l'aplicació")
 
     # Storage NAS Samba (Mount point al contenidor K8s)
     NAS_MOUNT_PATH: str = Field(default="/data/factures", description="Punt de muntatge del share Samba al contenidor")
@@ -739,6 +741,7 @@ FITXER: ./src/connectors/base.py
 # pyright: reportMissingImports=false
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -761,6 +764,33 @@ class BaseConnector(ABC):
         self.logger = logging.getLogger(f"connector.{self.name}")
         self.consecutive_failures: int = 0
         self.cooldown_until: datetime | None = None
+        self.progress_callback: Callable[[dict[str, Any]], None] | None = None
+
+    def report_progress(
+        self,
+        step: str,
+        current: int = 0,
+        total: int = 0,
+        status: str = "running",
+    ) -> None:
+        """Emet l'estat i el progrés exacte (ex: 3/40) cap a la UI per WebSocket i al log."""
+        pct = int((current / total) * 100) if total > 0 else 0
+        counter_str = f"[{current}/{total}] " if total > 0 else ""
+        self.logger.info(f"[{self.name.upper()}] {counter_str}{step}")
+        if self.progress_callback:
+            try:
+                self.progress_callback(
+                    {
+                        "connector": self.name.upper(),
+                        "step": step,
+                        "current": current,
+                        "total": total,
+                        "percent": pct,
+                        "status": status,
+                    }
+                )
+            except (TypeError, ValueError, RuntimeError, OSError) as e:
+                self.logger.debug(f"Error progress callback: {e}")
 
     def is_in_cooldown(self) -> bool:
         """Comprova si el connector està en pausa preventiva de seguretat."""
@@ -801,6 +831,7 @@ class BaseConnector(ABC):
         imap_client: ImapMailboxClient,
         mode: str = "normal",
         limit: int | None = None,
+        source: str = "auto",
     ) -> list[FacturaResult]:
         """Executa l'ETL per a aquest connector: descàrrega, parseig, emmagatzematge i ingesta.
 
@@ -808,6 +839,11 @@ class BaseConnector(ABC):
           - "normal": processament segons configuració (days_back per defecte)
           - "latest": cerca exclusivament l'última factura disponible
           - "all": cerca tot l'històric disponible
+
+        Fonts (source) admeses:
+          - "auto": cerca híbrida (bústia IMAP i portal web si cal)
+          - "email": cerca exclusivament als correus rebuts per IMAP
+          - "portal": descàrrega exclusivament des del portal web amb Playwright
         """
 
     def fetch_available_invoices(self, imap_client: ImapMailboxClient) -> list[dict[str, Any]]:
@@ -820,32 +856,35 @@ class BaseConnector(ABC):
         metriques: FacturaMetriques,
         origen: str,
     ) -> FacturaResult:
-        """Desa el fitxer PDF al volum NAS i envia les mètriques a InfluxDB."""
+        """Desa el fitxer PDF al volum NAS (si n'hi ha) i envia les mètriques a InfluxDB."""
         any_str = str(metriques.data_emissio.year)
         mes_str = f"{metriques.data_emissio.month:02d}"
         clean_num = metriques.numero_factura.replace("/", "_").replace("\\", "_").replace(" ", "")
         filename = f"{any_str}_{mes_str}_{self.name}_{clean_num}.pdf"
 
-        # Comprovar si ja existeix al NAS
-        ja_existeix = storage.exists(self.tipus.value, self.name, any_str, filename)
-
         pdf_saved_path: str | None = None
         nou_descarregat = False
 
-        if not ja_existeix or settings.DRY_RUN:
-            path = storage.save_pdf(
-                file_bytes=pdf_bytes,
-                tipus=self.tipus.value,
-                proveidor=self.name,
-                any_str=any_str,
-                filename=filename,
-            )
-            pdf_saved_path = str(path)
-            nou_descarregat = True
+        if pdf_bytes:
+            ja_existeix = storage.exists(self.tipus.value, self.name, any_str, filename)
+            if not ja_existeix or settings.DRY_RUN:
+                path = storage.save_pdf(
+                    file_bytes=pdf_bytes,
+                    tipus=self.tipus.value,
+                    proveidor=self.name,
+                    any_str=any_str,
+                    filename=filename,
+                )
+                pdf_saved_path = str(path)
+                nou_descarregat = True
+            else:
+                self.logger.info(f"La factura {filename} ja existeix al NAS Samba. Ometent sobreescriptura.")
+                dest_dir = storage.get_destination_dir(self.tipus.value, self.name, any_str)
+                pdf_saved_path = str(dest_dir / filename)
         else:
-            self.logger.info(f"La factura {filename} ja existeix al NAS Samba. Ometent sobreescriptura.")
-            dest_dir = storage.get_destination_dir(self.tipus.value, self.name, any_str)
-            pdf_saved_path = str(dest_dir / filename)
+            self.logger.info(
+                f"Sense contingut PDF per a {metriques.numero_factura} (origen={origen}). Ometent escriptura al NAS."
+            )
 
         # Enviar mètriques a InfluxDB
         influx_ok = influx_writer.write_factura_metrics(metriques)
@@ -897,6 +936,7 @@ from src.connectors.base import BaseConnector
 from src.email_client import ImapMailboxClient
 from src.models import FacturaMetriques, FacturaResult, SubministreType
 from src.pdf_parser import (
+    extract_date_range,
     extract_float_value,
     extract_regex_first,
     extract_text_from_pdf_bytes,
@@ -935,79 +975,81 @@ class BonpreuConnector(BaseConnector):
         imap_client: ImapMailboxClient,
         mode: str = "normal",
         limit: int | None = None,
+        source: str = "auto",
     ) -> list[FacturaResult]:
         results: list[FacturaResult] = []
         if not self.is_enabled():
+            self.report_progress("Connector Bonpreu desactivat per configuració.", status="warning")
             return results
 
         if self.is_in_cooldown():
             return results
 
-        fetch_limit = 1 if mode == "latest" else (limit or (None if mode == "all" else 3))
-        self.logger.info(f"Executant connector Bonpreu Esclat Energia (mode={mode}, limit={fetch_limit})...")
-
-        # 1. Analitzar correus d'avís de factura
         days_back = 730 if mode == "all" else settings.DAYS_BACK
-        emails = imap_client.fetch_recent_emails(
-            sender_filters=list(self.EMAIL_SENDERS),
-            days_back=days_back,
-        )
-        self.logger.info(f"Trobats {len(emails)} correus d'avís de Bonpreu Energia")
+        fetch_limit = 1 if mode == "latest" else (limit if limit is not None else (None if mode == "all" else 3))
 
-        trobat_avis = False
-        import_avis: float | None = None
-        data_avis: date | None = None
-
-        for em in emails:
-            trobat_avis = True
-            parsed_amt = parse_euro_amount(em.body_text) or parse_euro_amount(em.subject)
-            if parsed_amt is not None and import_avis is None:
-                import_avis = parsed_amt
-            if em.date and data_avis is None:
-                data_avis = em.date.date()
-
-            # Comprovació de seguretat: si per cas un dia Bonpreu adjunta el PDF directament
-            for att in em.attachments:
-                if att.filename.lower().endswith(".pdf"):
-                    self.logger.info(f"Detectat PDF adjunt directament a correu Bonpreu: {att.filename}")
-                    metriques = self.extract_metrics_from_pdf(att.data)
-                    if metriques:
-                        res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
-                        results.append(res)
-                        if mode == "latest":
-                            return results
-
-        if results:
-            return results
-
-        # 2. Si no hi ha PDF adjunt per correu, procedim a la descàrrega des del portal de clients
-        if not settings.BONPREU_USER or not settings.BONPREU_PASSWORD:
-            self.logger.warning(
-                "Credencials de portal Bonpreu (BONPREU_USER / BONPREU_PASSWORD) no definides. "
-                "No es pot fer scraping del portal per obtenir el PDF."
+        # 1. Extracció via Email (IMAP)
+        if source in ("auto", "email"):
+            self.report_progress(f"📧 Connectant a bústia IMAP per Bonpreu (últims {days_back} dies)...")
+            emails = imap_client.fetch_recent_emails(
+                sender_filters=list(self.EMAIL_SENDERS),
+                days_back=days_back,
             )
-            if trobat_avis and import_avis is not None:
-                data_final = data_avis or date.today()
-                metriques_avis = FacturaMetriques(
-                    proveidor=self.name,
-                    tipus=self.tipus,
-                    numero_factura=f"BONPREU-AVIS-{data_final.strftime('%Y%m')}",
-                    data_emissio=data_final,
-                    import_total=import_avis,
-                )
-                influx_ok = self.save_and_ingest(b"", metriques_avis, origen="email_notification")
-                results.append(influx_ok)
-            return results
+            emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
 
-        self.logger.info("Iniciant descàrrega de factures des del portal de Bonpreu Energia...")
-        pdf_list = self.fetch_invoices_from_portal(imap_client=imap_client, limit=fetch_limit)
-        for pdf_bytes, filename in pdf_list:
-            metriques = self.extract_metrics_from_pdf(pdf_bytes)
-            if metriques:
-                res = self.save_and_ingest(pdf_bytes, metriques, origen="web_portal_scraping")
-                results.append(res)
-                if mode == "latest":
-                    return results
+            pdf_attachments = [
+                (em, att) for em in emails for att in em.attachments if att.filename.lower().endswith(".pdf")
+            ]
+            if fetch_limit:
+                pdf_attachments = pdf_attachments[:fetch_limit]
+
+            total_pdfs = len(pdf_attachments)
+            self.report_progress(
+                f"📧 Trobats {len(emails)} correus d'avís i {total_pdfs} factures PDF adjuntes.",
+                current=0,
+                total=total_pdfs,
+            )
+
+            for idx, (em, att) in enumerate(pdf_attachments, start=1):
+                self.report_progress(
+                    f"📧 Processant PDF adjunt Bonpreu ({att.filename})...",
+                    current=idx,
+                    total=total_pdfs,
+                )
+                metriques = self.extract_metrics_from_pdf(att.data)
+                if metriques:
+                    res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
+                    results.append(res)
+
+            if source == "email":
+                return results
+            if results and mode != "all":
+                return results
+
+        # 2. Descàrrega des del portal de clients amb Playwright
+        if source in ("auto", "portal"):
+            if not settings.BONPREU_USER or not settings.BONPREU_PASSWORD:
+                msg = "❌ Faltan credencials BONPREU_USER / BONPREU_PASSWORD al Secret per entrar al portal web."
+                self.report_progress(msg, status="error")
+                if source == "portal":
+                    raise RuntimeError(msg)
+                return results
+
+            self.report_progress("🌐 Iniciant descàrrega de factures des del portal de Bonpreu Energia...")
+            pdf_list = self.fetch_invoices_from_portal(imap_client=imap_client, limit=fetch_limit)
+            total_dl = len(pdf_list)
+            for idx, (pdf_bytes, filename) in enumerate(pdf_list, start=1):
+                self.report_progress(
+                    f"💾 Analitzant i desant factura {filename} al NAS i InfluxDB...",
+                    current=idx,
+                    total=total_dl,
+                )
+                metriques = self.extract_metrics_from_pdf(pdf_bytes)
+                if metriques:
+                    res = self.save_and_ingest(pdf_bytes, metriques, origen="web_portal_scraping")
+                    results.append(res)
+                    if mode == "latest":
+                        return results
 
         return results
 
@@ -1130,12 +1172,20 @@ class BonpreuConnector(BaseConnector):
                     download_buttons = page.query_selector_all(
                         "a[href*='.pdf'], button:has-text('Descarregar'), a:has-text('PDF'), button:has-text('PDF')"
                     )
-                    max_dl = limit or 3
-                    self.logger.info(
-                        f"Trobats {len(download_buttons)} enllaços de descàrrega de factura (límit: {max_dl})"
+                    total_found = len(download_buttons)
+                    max_dl = min(limit, total_found) if limit is not None else total_found
+                    self.report_progress(
+                        f"🌐 Trobats {total_found} enllaços de descàrrega a Bonpreu. Iniciant {max_dl}...",
+                        current=0,
+                        total=max_dl,
                     )
 
-                    for i, btn in enumerate(download_buttons[:max_dl]):
+                    for i, btn in enumerate(download_buttons[:max_dl], start=1):
+                        self.report_progress(
+                            f"⬇️ Descarregant factura {i} de {max_dl} del portal Bonpreu...",
+                            current=i,
+                            total=max_dl,
+                        )
                         try:
                             with page.expect_download(timeout=15000) as download_info:
                                 btn.click()
@@ -1144,7 +1194,14 @@ class BonpreuConnector(BaseConnector):
                             if path:
                                 with open(path, "rb") as f:
                                     downloaded.append((f.read(), download.suggested_filename or f"bonpreu_{i}.pdf"))
-                        except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError) as err:
+                        except PlaywrightTimeoutError:
+                            self.report_progress(
+                                f"⏱️ Timeout (15s) descarregant factura {i}/{max_dl}. Saltant a la següent...",
+                                current=i,
+                                total=max_dl,
+                                status="warning",
+                            )
+                        except (PlaywrightError, TimeoutError, OSError) as err:
                             self.logger.warning(f"No s'ha pogut descarregar el botó {i}: {err}")
 
                 except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as page_err:
@@ -1230,17 +1287,10 @@ class BonpreuConnector(BaseConnector):
         potencia = extract_float_value(text, r"(?:Pot[èe]ncia\s*contractada|Potencia):?\s*(\d+(?:[.,]\d{1,2})?)\s*kW")
 
         # 6. Període facturat
-        periode_raw = extract_regex_first(
+        dt_inici, dt_fi = extract_date_range(
             text,
-            r"(?:Per[íi]ode\s*facturat|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:a|fins\s*a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+            r"(?:Per[íi]ode\s*facturat|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:a|fins\s*a|al|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         )
-        dt_inici: date | None = None
-        dt_fi: date | None = None
-        if periode_raw:
-            parts = re.split(r"\s*(?:a|fins\s*a|-)\s*", periode_raw)
-            if len(parts) == 2:
-                dt_inici = parse_date_catalan_spanish(parts[0])
-                dt_fi = parse_date_catalan_spanish(parts[1])
 
         # 7. CUPS d'electricitat (ES00...)
         cups = extract_regex_first(text, r"(ES\d{16,20}[A-Za-z]{0,2})")
@@ -1262,6 +1312,43 @@ class BonpreuConnector(BaseConnector):
             cups_o_referencia=cups,
         )
 
+    def fetch_available_invoices(self, imap_client: ImapMailboxClient) -> list[dict]:
+        """Llista les factures de Bonpreu trobades per avisos de correu i al NAS."""
+        invoices: list[dict] = []
+        if not self.is_enabled():
+            return invoices
+
+        from src.storage import storage
+
+        emails = imap_client.fetch_recent_emails(sender_filters=list(self.EMAIL_SENDERS), days_back=730)
+        emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
+
+        for em in emails:
+            d_str = em.date.strftime("%Y-%m-%d") if em.date else "Data desconeguda"
+            any_str = str(em.date.year) if em.date else str(date.today().year)
+            mes_str = f"{em.date.month:02d}" if em.date else "01"
+            parsed_amt = parse_euro_amount(em.body_text) or parse_euro_amount(em.subject) or 0.0
+
+            dest_dir = storage.get_destination_dir(self.tipus.value, self.name, any_str)
+            existing_pdfs = list(dest_dir.glob(f"{any_str}_{mes_str}_{self.name}_*.pdf"))
+            ja_al_nas = len(existing_pdfs) > 0
+
+            inv_num = existing_pdfs[0].stem.split(f"_{self.name}_")[-1] if ja_al_nas else f"AVIS-{any_str}{mes_str}"
+
+            invoices.append(
+                {
+                    "id": f"{em.msg_id}_bonpreu_{any_str}_{mes_str}",
+                    "proveidor": self.name,
+                    "tipus": self.tipus.value,
+                    "data": d_str,
+                    "numero": inv_num,
+                    "import": parsed_amt,
+                    "subject": em.subject,
+                    "exists_in_nas": ja_al_nas,
+                }
+            )
+        return invoices
+
 
 FITXER: ./src/connectors/catgas.py
 
@@ -1275,6 +1362,7 @@ from src.connectors.base import BaseConnector
 from src.email_client import ImapMailboxClient
 from src.models import FacturaMetriques, FacturaResult, SubministreType
 from src.pdf_parser import (
+    extract_date_range,
     extract_float_value,
     extract_regex_first,
     extract_text_from_pdf_bytes,
@@ -1304,41 +1392,60 @@ class CatgasConnector(BaseConnector):
         imap_client: ImapMailboxClient,
         mode: str = "normal",
         limit: int | None = None,
+        source: str = "auto",
     ) -> list[FacturaResult]:
         results: list[FacturaResult] = []
         if not self.is_enabled():
+            self.report_progress("Connector Catgas desactivat per configuració.", status="warning")
             return results
 
+        if source == "portal":
+            self.report_progress(
+                "⚠️ Catgas només rep factures per Correu IMAP (no disposa de scraper web). Cercant al correu...",
+                status="warning",
+            )
+
         days_back = 730 if mode == "all" else settings.DAYS_BACK
-        self.logger.info(f"Executant connector Catgas (Gas natural, mode={mode})...")
+        self.report_progress(f"📧 Connectant a bústia IMAP per Catgas (últims {days_back} dies)...")
 
         emails = imap_client.fetch_recent_emails(
             sender_filters=list(self.EMAIL_SENDERS),
             days_back=days_back,
         )
-        self.logger.info(f"Trobats {len(emails)} correus potencials de Catgas")
-
-        # Ordenar els correus del més recent al més antic
         emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
 
-        for em in emails:
-            for att in em.attachments:
-                if not att.filename.lower().endswith(".pdf"):
-                    continue
+        pdf_attachments = [
+            (em, att) for em in emails for att in em.attachments if att.filename.lower().endswith(".pdf")
+        ]
+        fetch_limit = 1 if mode == "latest" else (limit if limit is not None else (None if mode == "all" else 3))
+        if fetch_limit:
+            pdf_attachments = pdf_attachments[:fetch_limit]
 
-                self.logger.info(f"Processant fitxer adjunt de Catgas: {att.filename} de '{em.subject}'")
-                metriques = self.extract_metrics_from_pdf(att.data)
-                if not metriques:
-                    metriques = self._fallback_metrics(att.data, em.date.date() if em.date else date.today())
+        total_pdfs = len(pdf_attachments)
+        self.report_progress(
+            f"📧 Trobats {len(emails)} correus i {total_pdfs} factures PDF adjuntes.",
+            current=0,
+            total=total_pdfs,
+        )
 
-                if metriques:
-                    res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
-                    results.append(res)
+        for idx, (em, att) in enumerate(pdf_attachments, start=1):
+            self.report_progress(
+                f"📧 Processant factura Catgas {idx}/{total_pdfs}: {att.filename}",
+                current=idx,
+                total=total_pdfs,
+            )
+            metriques = self.extract_metrics_from_pdf(att.data)
+            if not metriques:
+                metriques = self._fallback_metrics(att.data, em.date.date() if em.date else date.today())
 
-                    if mode == "latest":
-                        return results
-                    if limit and len(results) >= limit:
-                        return results
+            if metriques:
+                res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
+                results.append(res)
+
+                if mode == "latest":
+                    return results
+                if limit and len(results) >= limit:
+                    return results
 
         return results
 
@@ -1357,14 +1464,24 @@ class CatgasConnector(BaseConnector):
             for att in em.attachments:
                 if not att.filename.lower().endswith(".pdf"):
                     continue
-                d_str = em.date.strftime("%Y-%m-%d") if em.date else "Data desconeguda"
-                any_str = str(em.date.year) if em.date else str(date.today().year)
-                mes_str = f"{em.date.month:02d}" if em.date else "01"
 
-                # Deduïm el nom normalitzat del fitxer al NAS
-                clean_name = re.sub(r"[^A-Za-z0-9_-]", "_", att.filename.replace(".pdf", "").replace(".PDF", ""))
-                expected_filename = f"{any_str}_{mes_str}_{self.name}_{clean_name}.pdf"
-                parsed_amt = parse_euro_amount(em.subject) or parse_euro_amount(em.body_text) or 0.0
+                metriques = self.extract_metrics_from_pdf(att.data)
+                if metriques:
+                    any_str = str(metriques.data_emissio.year)
+                    mes_str = f"{metriques.data_emissio.month:02d}"
+                    clean_num = metriques.numero_factura.replace("/", "_").replace("\\", "_").replace(" ", "")
+                    expected_filename = f"{any_str}_{mes_str}_{self.name}_{clean_num}.pdf"
+                    d_str = str(metriques.data_emissio)
+                    parsed_amt = metriques.import_total
+                    num_display = metriques.numero_factura
+                else:
+                    d_str = em.date.strftime("%Y-%m-%d") if em.date else "Data desconeguda"
+                    any_str = str(em.date.year) if em.date else str(date.today().year)
+                    mes_str = f"{em.date.month:02d}" if em.date else "01"
+                    clean_name = re.sub(r"[^A-Za-z0-9_-]", "_", att.filename.replace(".pdf", "").replace(".PDF", ""))
+                    expected_filename = f"{any_str}_{mes_str}_{self.name}_{clean_name}.pdf"
+                    parsed_amt = parse_euro_amount(em.subject) or parse_euro_amount(em.body_text) or 0.0
+                    num_display = att.filename.replace(".pdf", "")
 
                 ja_al_nas = storage.exists(self.tipus.value, self.name, any_str, expected_filename)
                 invoices.append(
@@ -1373,7 +1490,7 @@ class CatgasConnector(BaseConnector):
                         "proveidor": self.name,
                         "tipus": self.tipus.value,
                         "data": d_str,
-                        "numero": att.filename.replace(".pdf", ""),
+                        "numero": num_display,
                         "import": parsed_amt,
                         "subject": em.subject,
                         "exists_in_nas": ja_al_nas,
@@ -1420,17 +1537,10 @@ class CatgasConnector(BaseConnector):
         consum_m3 = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*m[3³]")
 
         # 5. Dates del període
-        periode_raw = extract_regex_first(
+        dt_inici, dt_fi = extract_date_range(
             text,
             r"(?:Per[íi]ode\s*de\s*facturaci[óo]|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:fins\s*a|a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         )
-        dt_inici: date | None = None
-        dt_fi: date | None = None
-        if periode_raw:
-            parts = re.split(r"\s*(?:fins\s*a|a|-)\s*", periode_raw)
-            if len(parts) == 2:
-                dt_inici = parse_date_catalan_spanish(parts[0])
-                dt_fi = parse_date_catalan_spanish(parts[1])
 
         # 6. CUPS de gas (ES02...)
         cups = extract_regex_first(text, r"(ES\d{16,20}[A-Za-z]{0,2})")
@@ -1488,6 +1598,7 @@ from src.connectors.base import BaseConnector
 from src.email_client import ImapMailboxClient
 from src.models import FacturaMetriques, FacturaResult, SubministreType
 from src.pdf_parser import (
+    extract_date_range,
     extract_float_value,
     extract_regex_first,
     extract_text_from_pdf_bytes,
@@ -1525,79 +1636,81 @@ class DigiConnector(BaseConnector):
         imap_client: ImapMailboxClient,
         mode: str = "normal",
         limit: int | None = None,
+        source: str = "auto",
     ) -> list[FacturaResult]:
         results: list[FacturaResult] = []
         if not self.is_enabled():
+            self.report_progress("Connector Digi desactivat per configuració.", status="warning")
             return results
 
         if self.is_in_cooldown():
             return results
 
-        fetch_limit = 1 if mode == "latest" else (limit or (None if mode == "all" else 3))
-        self.logger.info(f"Executant connector Digi Mobil (mode={mode}, limit={fetch_limit})...")
-
-        # 1. Comprovar correus d'avís de Digi
         days_back = 730 if mode == "all" else settings.DAYS_BACK
-        emails = imap_client.fetch_recent_emails(
-            sender_filters=list(self.EMAIL_SENDERS),
-            days_back=days_back,
-        )
-        self.logger.info(f"Trobats {len(emails)} correus d'avís de Digi Mobil")
+        fetch_limit = 1 if mode == "latest" else (limit if limit is not None else (None if mode == "all" else 3))
 
-        trobat_avis = False
-        import_avis: float | None = None
-        data_avis: date | None = None
+        # 1. Extracció via Email (IMAP)
+        if source in ("auto", "email"):
+            self.report_progress(f"📧 Connectant a bústia IMAP per Digi (últims {days_back} dies)...")
+            emails = imap_client.fetch_recent_emails(
+                sender_filters=list(self.EMAIL_SENDERS),
+                days_back=days_back,
+            )
+            emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
 
-        for em in emails:
-            trobat_avis = True
-            parsed_amt = parse_euro_amount(em.body_text) or parse_euro_amount(em.subject)
-            if parsed_amt is not None and import_avis is None:
-                import_avis = parsed_amt
-            if em.date and data_avis is None:
-                data_avis = em.date.date()
+            pdf_attachments = [
+                (em, att) for em in emails for att in em.attachments if att.filename.lower().endswith(".pdf")
+            ]
+            if fetch_limit:
+                pdf_attachments = pdf_attachments[:fetch_limit]
 
-            # Comprovació si el correu inclou PDF adjunt
-            for att in em.attachments:
-                if att.filename.lower().endswith(".pdf"):
-                    self.logger.info(f"Detectat PDF adjunt a correu Digi: {att.filename}")
-                    metriques = self.extract_metrics_from_pdf(att.data)
-                    if metriques:
-                        res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
-                        results.append(res)
-                        if mode == "latest":
-                            return results
+            total_pdfs = len(pdf_attachments)
+            self.report_progress(
+                f"📧 Trobats {len(emails)} correus i {total_pdfs} factures PDF adjuntes.",
+                current=0,
+                total=total_pdfs,
+            )
 
-        if results:
-            return results
+            for idx, (em, att) in enumerate(pdf_attachments, start=1):
+                self.report_progress(
+                    f"📧 Processant PDF de Digi ({att.filename})...",
+                    current=idx,
+                    total=total_pdfs,
+                )
+                metriques = self.extract_metrics_from_pdf(att.data)
+                if metriques:
+                    res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
+                    results.append(res)
+
+            if source == "email":
+                return results
+            if results and mode != "all":
+                return results
 
         # 2. Descàrrega des de Mi Digi si no hi ha PDF adjunt
-        if not settings.DIGI_USER or not settings.DIGI_PASSWORD:
-            self.logger.warning(
-                "Credencials de Mi Digi (DIGI_USER / DIGI_PASSWORD) no definides. "
-                "No es pot fer descàrrega automàtica del PDF des del portal."
-            )
-            if trobat_avis and import_avis is not None:
-                data_final = data_avis or date.today()
-                metriques_avis = FacturaMetriques(
-                    proveidor=self.name,
-                    tipus=self.tipus,
-                    numero_factura=f"DIGI-AVIS-{data_final.strftime('%Y%m')}",
-                    data_emissio=data_final,
-                    import_total=import_avis,
-                )
-                res = self.save_and_ingest(b"", metriques_avis, origen="email_notification")
-                results.append(res)
-            return results
+        if source in ("auto", "portal"):
+            if not settings.DIGI_USER or not settings.DIGI_PASSWORD:
+                msg = "❌ Faltan credencials DIGI_USER / DIGI_PASSWORD al Secret per entrar a Mi Digi."
+                self.report_progress(msg, status="error")
+                if source == "portal":
+                    raise RuntimeError(msg)
+                return results
 
-        self.logger.info("Iniciant descàrrega de factures des del portal Mi Digi...")
-        pdf_list = self.fetch_invoices_from_portal(limit=fetch_limit)
-        for pdf_bytes, filename in pdf_list:
-            metriques = self.extract_metrics_from_pdf(pdf_bytes)
-            if metriques:
-                res = self.save_and_ingest(pdf_bytes, metriques, origen="web_portal_scraping")
-                results.append(res)
-                if mode == "latest":
-                    return results
+            self.report_progress("🌐 Iniciant descàrrega de factures des del portal Mi Digi...")
+            pdf_list = self.fetch_invoices_from_portal(limit=fetch_limit)
+            total_dl = len(pdf_list)
+            for idx, (pdf_bytes, filename) in enumerate(pdf_list, start=1):
+                self.report_progress(
+                    f"💾 Analitzant i desant factura {filename} al NAS i InfluxDB...",
+                    current=idx,
+                    total=total_dl,
+                )
+                metriques = self.extract_metrics_from_pdf(pdf_bytes)
+                if metriques:
+                    res = self.save_and_ingest(pdf_bytes, metriques, origen="web_portal_scraping")
+                    results.append(res)
+                    if mode == "latest":
+                        return results
 
         return results
 
@@ -1701,12 +1814,20 @@ class DigiConnector(BaseConnector):
                     download_buttons = page.query_selector_all(
                         "a[data-gtm-category='invoice'], a:has-text('Descargar'), button:has-text('Descargar'), a[href*='.pdf']"
                     )
-                    max_dl = limit or 6
-                    self.logger.info(
-                        f"Trobats {len(download_buttons)} enllaços de descàrrega de factura a Mi Digi (límit: {max_dl})"
+                    total_found = len(download_buttons)
+                    max_dl = min(limit, total_found) if limit is not None else total_found
+                    self.report_progress(
+                        f"🌐 Trobats {total_found} enllaços de descàrrega a Mi Digi. Iniciant {max_dl}...",
+                        current=0,
+                        total=max_dl,
                     )
 
-                    for i, btn in enumerate(download_buttons[:max_dl]):
+                    for i, btn in enumerate(download_buttons[:max_dl], start=1):
+                        self.report_progress(
+                            f"⬇️ Descarregant factura {i} de {max_dl} del portal Mi Digi...",
+                            current=i,
+                            total=max_dl,
+                        )
                         try:
                             with page.expect_download(timeout=15000) as download_info:
                                 btn.click()
@@ -1717,7 +1838,14 @@ class DigiConnector(BaseConnector):
                                     downloaded.append(
                                         (f.read(), download.suggested_filename or f"digi_factura_{i}.pdf")
                                     )
-                        except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError) as err:
+                        except PlaywrightTimeoutError:
+                            self.report_progress(
+                                f"⏱️ Timeout (15s) descarregant factura {i}/{max_dl}. Saltant a la següent...",
+                                current=i,
+                                total=max_dl,
+                                status="warning",
+                            )
+                        except (PlaywrightError, TimeoutError, OSError) as err:
                             self.logger.warning(f"No s'ha pogut descarregar la factura {i}: {err}")
 
                 except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as page_err:
@@ -1755,15 +1883,26 @@ class DigiConnector(BaseConnector):
             text, r"(?:Fecha\s*de\s*emisi[óo]n|Data\s*d'emissi[óo]):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
         )
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
+        if not data_emissio and num_factura:
+            # Deducim l'any i el mes del patró oficial DGFC + AA + MM
+            dgfc_match = re.search(r"DGFC(\d{2})(\d{2})", num_factura)
+            if dgfc_match:
+                try:
+                    any_d = 2000 + int(dgfc_match.group(1))
+                    mes_d = int(dgfc_match.group(2))
+                    data_emissio = date(any_d, mes_d, 1)
+                except ValueError:
+                    pass
 
-        # 3. Import total (prioritzant el total oficial de factura)
+        # 3. Import total (prioritzant el total oficial de factura amb 2 decimals)
         total_eur = extract_float_value(
-            text, r"(?:Total\s*a\s*pagar.*?|TOTAL\s*FACTURA.*?|Import\s*total.*?):\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
+            text,
+            r"(?:Total\s*a\s*pagar|TOTAL\s*FACTURA|Import\s*total|Importe\s*total)[^0-9\n]{0,30}?[:\s]\s*(\d{1,4}[.,]\d{2})\s*€?",
         )
         if total_eur is None:
-            total_eur = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*€\s*TOTAL\s*FACTURA")
+            total_eur = extract_float_value(text, r"(\d{1,4}[.,]\d{2})\s*€?\s*TOTAL\s*FACTURA")
         if total_eur is None:
-            total_eur = extract_float_value(text, r"TOTAL\s*SERVICIOS\s*(\d+(?:[.,]\d{1,2})?)\s*€?")
+            total_eur = extract_float_value(text, r"TOTAL\s*SERVICIOS[^0-9]{0,20}?(\d{1,4}[.,]\d{2})\s*€?")
         if total_eur is None:
             total_eur = parse_euro_amount(text)
 
@@ -1771,17 +1910,10 @@ class DigiConnector(BaseConnector):
             return None
 
         # 4. Període facturat
-        periode_raw = extract_regex_first(
+        dt_inici, dt_fi = extract_date_range(
             text,
             r"(?:Per[íi]odo\s*de\s*facturaci[óo]n|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:al|a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         )
-        dt_inici: date | None = None
-        dt_fi: date | None = None
-        if periode_raw:
-            parts = re.split(r"\s*(?:al|a|-)\s*", periode_raw)
-            if len(parts) == 2:
-                dt_inici = parse_date_catalan_spanish(parts[0])
-                dt_fi = parse_date_catalan_spanish(parts[1])
 
         # 5. Dades addicionals de telefonia
         total_gb = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*GB")
@@ -1797,6 +1929,67 @@ class DigiConnector(BaseConnector):
             import_total=float(total_eur),
             total_gb_consumits=total_gb,
         )
+
+    def fetch_available_invoices(self, imap_client: ImapMailboxClient) -> list[dict]:
+        """Llista les factures de Digi trobades a la bústia i al NAS."""
+        invoices: list[dict] = []
+        if not self.is_enabled():
+            return invoices
+
+        from src.storage import storage
+
+        emails = imap_client.fetch_recent_emails(sender_filters=list(self.EMAIL_SENDERS), days_back=730)
+        emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
+
+        for em in emails:
+            d_str = em.date.strftime("%Y-%m-%d") if em.date else "Data desconeguda"
+            any_str = str(em.date.year) if em.date else str(date.today().year)
+            mes_str = f"{em.date.month:02d}" if em.date else "01"
+
+            # 1. Si porta PDF adjunt
+            pdf_found = False
+            for att in em.attachments:
+                if att.filename.lower().endswith(".pdf"):
+                    pdf_found = True
+                    metriques = self.extract_metrics_from_pdf(att.data)
+                    if metriques:
+                        clean_num = metriques.numero_factura.replace("/", "_").replace("\\", "_").replace(" ", "")
+                        exp_name = f"{any_str}_{mes_str}_{self.name}_{clean_num}.pdf"
+                        ja_al_nas = storage.exists(self.tipus.value, self.name, any_str, exp_name)
+                        invoices.append(
+                            {
+                                "id": f"{em.msg_id}_{att.filename}",
+                                "proveidor": self.name,
+                                "tipus": self.tipus.value,
+                                "data": str(metriques.data_emissio),
+                                "numero": metriques.numero_factura,
+                                "import": metriques.import_total,
+                                "subject": em.subject,
+                                "exists_in_nas": ja_al_nas,
+                            }
+                        )
+                    break
+
+            if not pdf_found:
+                parsed_amt = parse_euro_amount(em.body_text) or parse_euro_amount(em.subject) or 0.0
+                dest_dir = storage.get_destination_dir(self.tipus.value, self.name, any_str)
+                existing_pdfs = list(dest_dir.glob(f"{any_str}_{mes_str}_{self.name}_*.pdf"))
+                ja_al_nas = len(existing_pdfs) > 0
+                inv_num = existing_pdfs[0].stem.split(f"_{self.name}_")[-1] if ja_al_nas else f"AVIS-{any_str}{mes_str}"
+
+                invoices.append(
+                    {
+                        "id": f"{em.msg_id}_digi_{any_str}_{mes_str}",
+                        "proveidor": self.name,
+                        "tipus": self.tipus.value,
+                        "data": d_str,
+                        "numero": inv_num,
+                        "import": parsed_amt,
+                        "subject": em.subject,
+                        "exists_in_nas": ja_al_nas,
+                    }
+                )
+        return invoices
 
 
 FITXER: ./src/connectors/veolia.py
@@ -1825,6 +2018,7 @@ from src.connectors.base import BaseConnector
 from src.email_client import ImapMailboxClient
 from src.models import FacturaMetriques, FacturaResult, SubministreType
 from src.pdf_parser import (
+    extract_date_range,
     extract_float_value,
     extract_regex_first,
     extract_text_from_pdf_bytes,
@@ -1856,72 +2050,88 @@ class VeoliaConnector(BaseConnector):
         imap_client: ImapMailboxClient,
         mode: str = "normal",
         limit: int | None = None,
+        source: str = "auto",
     ) -> list[FacturaResult]:
         results: list[FacturaResult] = []
         if not self.is_enabled():
+            self.report_progress("Connector desactivat per configuració.", status="warning")
             return results
 
         days_back = 730 if mode == "all" else settings.DAYS_BACK
-        self.logger.info(f"Executant connector Veolia (Aigua, mode={mode})...")
+        fetch_limit = 1 if mode == "latest" else (limit if limit is not None else (None if mode == "all" else 3))
 
         # 1. Extracció via Email (IMAP)
-        emails = imap_client.fetch_recent_emails(
-            sender_filters=list(self.EMAIL_SENDERS),
-            days_back=days_back,
-        )
-        self.logger.info(f"Trobats {len(emails)} correus potencials de Veolia")
+        if source in ("auto", "email"):
+            self.report_progress(f"📧 Connectant a bústia IMAP (últims {days_back} dies)...")
+            emails = imap_client.fetch_recent_emails(
+                sender_filters=list(self.EMAIL_SENDERS),
+                days_back=days_back,
+            )
+            emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
 
-        # Ordenar els correus del més recent al més antic
-        emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
+            pdf_attachments = [
+                (em, att) for em in emails for att in em.attachments if att.filename.lower().endswith(".pdf")
+            ]
+            if fetch_limit:
+                pdf_attachments = pdf_attachments[:fetch_limit]
 
-        for em in emails:
-            for att in em.attachments:
-                if not att.filename.lower().endswith(".pdf"):
-                    continue
+            total_pdfs = len(pdf_attachments)
+            self.report_progress(
+                f"📧 Trobats {len(emails)} correus i {total_pdfs} factures PDF adjuntes.",
+                current=0,
+                total=total_pdfs,
+            )
 
-                self.logger.info(f"Processant fitxer adjunt de Veolia: {att.filename} de '{em.subject}'")
-                metriques = self.extract_metrics_from_pdf(att.data)
-                if not metriques:
-                    # Fallback si no troba número o data específica: intentem extreure data del correu
-                    metriques = self._fallback_metrics(att.data, em.date.date() if em.date else date.today())
-
+            for idx, (em, att) in enumerate(pdf_attachments, start=1):
+                self.report_progress(
+                    f"📧 Processant PDF de correu ({att.filename})...",
+                    current=idx,
+                    total=total_pdfs,
+                )
+                metriques = self.extract_metrics_from_pdf(att.data) or self._fallback_metrics(
+                    att.data, em.date.date() if em.date else date.today()
+                )
                 if metriques:
                     res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
                     results.append(res)
 
-                    if mode == "latest":
-                        return results
-                    if limit and len(results) >= limit:
-                        return results
+            if source == "email":
+                return results
+            if results and mode != "all":
+                return results
 
-        if results:
-            return results
+        # 2. Extracció via Portal Web (Playwright)
+        if source in ("auto", "portal"):
+            if not settings.VEOLIA_USER or not settings.VEOLIA_PASSWORD:
+                msg = "❌ Faltan credencials VEOLIA_USER / VEOLIA_PASSWORD al Secret per entrar al portal web."
+                self.report_progress(msg, status="error")
+                if source == "portal":
+                    raise RuntimeError(msg)
+                return results
 
-        # 2. Descàrrega directa des del portal d'Agbar-Veolia si no hi ha PDF per correu
-        if settings.VEOLIA_USER and settings.VEOLIA_PASSWORD:
-            fetch_limit = 1 if mode == "latest" else (limit or (None if mode == "all" else 3))
-            self.logger.info(f"Iniciant descàrrega des del portal web d'Agbar-Veolia (límit: {fetch_limit})...")
             pdf_list = self.fetch_invoices_from_portal(limit=fetch_limit)
-            for pdf_bytes, filename in pdf_list:
-                metriques = self.extract_metrics_from_pdf(pdf_bytes)
-                if not metriques:
-                    metriques = self._fallback_metrics(pdf_bytes, date.today())
+            total_dl = len(pdf_list)
+            for idx, (pdf_bytes, filename) in enumerate(pdf_list, start=1):
+                self.report_progress(
+                    f"💾 Analitzant i desant PDF {filename} al NAS i InfluxDB...",
+                    current=idx,
+                    total=total_dl,
+                )
+                metriques = self.extract_metrics_from_pdf(pdf_bytes) or self._fallback_metrics(pdf_bytes, date.today())
                 if metriques:
                     res = self.save_and_ingest(pdf_bytes, metriques, origen="web_portal_scraping")
                     results.append(res)
-                    if mode == "latest":
-                        return results
 
         return results
 
     def fetch_invoices_from_portal(self, limit: int | None = 3) -> list[tuple[bytes, str]]:
-        """Autenticació al portal de clients d'Agbar/Veolia via Playwright i descàrrega de factures."""
+        """Autenticació al portal d'Agbar/Veolia via Playwright amb traçabilitat pas a pas."""
         downloaded: list[tuple[bytes, str]] = []
         if self.is_in_cooldown():
             return downloaded
 
         if not HAVE_PLAYWRIGHT or sync_playwright is None:
-            self.logger.warning("Playwright no està instal·lat en aquest entorn.")
+            self.report_progress("❌ Playwright no està instal·lat al contenidor.", status="error")
             return downloaded
 
         session_dir = Path(settings.NAS_MOUNT_PATH) / ".sessions"
@@ -1932,57 +2142,131 @@ class VeoliaConnector(BaseConnector):
             pass
 
         try:
+            self.report_progress("🌐 Iniciant navegador headless Chromium per a Veolia...")
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=settings.HEADLESS_BROWSER)
                 try:
                     context_kwargs: dict[str, Any] = {"accept_downloads": True}
                     if session_file.exists():
-                        self.logger.info("Carregant sessió prèvia d'Agbar-Veolia des del NAS...")
+                        self.report_progress("🌐 Carregant sessió prèvia de Veolia des del NAS...")
                         context_kwargs["storage_state"] = str(session_file)
 
                     context = browser.new_context(**context_kwargs)
                     page = context.new_page()
 
-                    # 1. Intentem anar directament a l'apartat de factures
-                    self.logger.info(f"Obrint factures d'Agbar-Veolia: {self.PORTAL_INVOICES_URL}")
-                    page.goto(self.PORTAL_INVOICES_URL, timeout=settings.SCRAPER_TIMEOUT_MS)
-                    page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+                    # 1. Obrir portal (domcontentloaded per evitar bloqueig per scripts d'analítica)
+                    self.report_progress(f"🌐 Obrint portal Veolia ({self.PORTAL_INVOICES_URL})...")
+                    page.goto(
+                        self.PORTAL_INVOICES_URL,
+                        wait_until="domcontentloaded",
+                        timeout=settings.SCRAPER_TIMEOUT_MS,
+                    )
+                    page.wait_for_timeout(2500)
 
-                    # 2. Si ens redirigeix al formulari de login, iniciem sessió
-                    if "login" in page.url.lower() or page.query_selector("#loginForm"):
-                        self.logger.info("Sessió no activa a Agbar-Veolia. Iniciant login...")
-                        page.fill("input#login, input[name='_CustomLoginPortlet_login']", settings.VEOLIA_USER or "")
-                        page.fill(
-                            "input#password, input[name='_CustomLoginPortlet_password']", settings.VEOLIA_PASSWORD or ""
+                    # Acceptar cookies si apareix OneTrust
+                    try:
+                        cookie_btn = page.query_selector(
+                            "#onetrust-accept-btn-handler, button:has-text('Acceptar'), button:has-text('Aceptar')"
                         )
-                        page.click("button#btn-submit, button[type='submit']")
-                        page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+                        if cookie_btn and cookie_btn.is_visible():
+                            self.report_progress("🍪 Acceptant banner de cookies...")
+                            cookie_btn.click()
+                            page.wait_for_timeout(1000)
+                    except PlaywrightError:
+                        pass
 
-                    # 3. Si hem accedit correctament, desem la sessió al NAS
-                    if "login" not in page.url.lower():
-                        try:
-                            context.storage_state(path=str(session_file))
-                            self.logger.info("✅ Sessió d'Agbar-Veolia desada al NAS!")
-                        except (OSError, RuntimeError):
-                            pass
+                    # 2. Comprovar si cal fer login
+                    login_input = page.query_selector(
+                        "input#login, input[name*='login'], input[type='email'], input[name='username']"
+                    )
+                    pass_input = page.query_selector("input#password, input[name*='password'], input[type='password']")
 
-                    # 4. Navegar a factures si cal
-                    if "mis-facturas" not in page.url.lower():
-                        page.goto(self.PORTAL_INVOICES_URL, timeout=settings.SCRAPER_TIMEOUT_MS)
-                        page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+                    if "login" in page.url.lower() or (login_input and pass_input):
+                        self.report_progress(f"🔑 Sessió no activa. Autenticant usuari '{settings.VEOLIA_USER}'...")
+                        if not login_input or not pass_input:
+                            page.goto(
+                                self.PORTAL_LOGIN_URL,
+                                wait_until="domcontentloaded",
+                                timeout=settings.SCRAPER_TIMEOUT_MS,
+                            )
+                            page.wait_for_timeout(2000)
+                            login_input = page.query_selector(
+                                "input#login, input[name*='login'], input[type='email'], input[name='username']"
+                            )
+                            pass_input = page.query_selector(
+                                "input#password, input[name*='password'], input[type='password']"
+                            )
 
-                    # 5. Cerca botons de descàrrega de factura digital (segons DOM real d'Agbar)
+                        if not login_input or not pass_input:
+                            msg = f"No s'ha trobat el formulari de login a {page.url}"
+                            self.record_failure(msg)
+                            self.report_progress(f"❌ {msg}", status="error")
+                            return downloaded
+
+                        login_input.fill(settings.VEOLIA_USER or "")
+                        pass_input.fill(settings.VEOLIA_PASSWORD or "")
+                        submit_btn = page.query_selector(
+                            "button#btn-submit, button[type='submit'], input[type='submit']"
+                        )
+                        if submit_btn:
+                            submit_btn.click()
+                        else:
+                            pass_input.press("Enter")
+
+                        page.wait_for_load_state("domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS)
+                        page.wait_for_timeout(3500)
+
+                        if "login" in page.url.lower() and page.query_selector("input[type='password']"):
+                            msg = "Login rebutjat a Veolia (revisa usuari/contrasenya o bloqueig captcha)."
+                            self.record_failure(msg)
+                            self.report_progress(f"❌ {msg}", status="error")
+                            return downloaded
+
+                    # 3. Desar sessió vàlida
+                    try:
+                        context.storage_state(path=str(session_file))
+                    except (OSError, RuntimeError):
+                        pass
+
+                    # 4. Anar a l'apartat de factures si cal
+                    if "mis-facturas" not in page.url.lower() and "factur" not in page.url.lower():
+                        self.report_progress("🌐 Accedint al llistat de factures de Veolia...")
+                        page.goto(
+                            self.PORTAL_INVOICES_URL,
+                            wait_until="domcontentloaded",
+                            timeout=settings.SCRAPER_TIMEOUT_MS,
+                        )
+                        page.wait_for_timeout(3000)
+
+                    # 5. Cercar enllaços de descàrrega de PDF (segons DOM real)
                     download_buttons = page.query_selector_all(
-                        "#descargar-factura-digital a, a:has-text('Descarrega factura digital'), a[href*='descargarFacturaPdf']"
+                        "#descargar-factura-digital a, a:has-text('Descarrega'), a:has-text('Descargar'), "
+                        "a[href*='descargarFacturaPdf'], a[onclick*='descargarFacturaPdf'], a[href*='.pdf'], button:has-text('PDF')"
                     )
-                    max_dl = limit or 3
-                    self.logger.info(
-                        f"Trobats {len(download_buttons)} enllaços de descàrrega a Agbar-Veolia (límit: {max_dl})"
+                    total_found = len(download_buttons)
+                    max_dl = min(limit, total_found) if limit is not None else total_found
+
+                    if total_found == 0:
+                        self.report_progress(
+                            f"⚠️ Connectat a {page.url}, però s'han trobat 0 botons de factura descarregables.",
+                            status="warning",
+                        )
+                        return downloaded
+
+                    self.report_progress(
+                        f"🌐 Trobades {total_found} factures al portal. Iniciant descàrrega de {max_dl}...",
+                        current=0,
+                        total=max_dl,
                     )
 
-                    for i, btn in enumerate(download_buttons[:max_dl]):
+                    for i, btn in enumerate(download_buttons[:max_dl], start=1):
+                        self.report_progress(
+                            f"⬇️ Descarregant factura {i} de {max_dl} des del portal Veolia...",
+                            current=i,
+                            total=max_dl,
+                        )
                         try:
-                            with page.expect_download(timeout=15000) as download_info:
+                            with page.expect_download(timeout=20000) as download_info:
                                 btn.click()
                             download = download_info.value
                             path = download.path()
@@ -1991,18 +2275,29 @@ class VeoliaConnector(BaseConnector):
                                     downloaded.append(
                                         (f.read(), download.suggested_filename or f"veolia_factura_{i}.pdf")
                                     )
-                        except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError) as err:
-                            self.logger.warning(f"No s'ha pogut descarregar la factura {i}: {err}")
+                        except PlaywrightTimeoutError:
+                            self.report_progress(
+                                f"⏱️ Timeout (20s) esperant la descàrrega de la factura {i}/{max_dl}. Saltant a la següent...",
+                                current=i,
+                                total=max_dl,
+                                status="warning",
+                            )
+                        except (PlaywrightError, TimeoutError, OSError) as err:
+                            self.logger.warning(f"Error en factura {i}/{max_dl}: {err}")
 
-                except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as page_err:
-                    self.record_failure(f"Error de navegació a Agbar-Veolia: {page_err}")
-                    self.logger.error(f"Error navegant al portal Agbar-Veolia: {page_err}")
+                except PlaywrightTimeoutError as t_err:
+                    msg = f"⏱️ Timeout carregant el portal de Veolia ({settings.SCRAPER_TIMEOUT_MS}ms): {t_err}"
+                    self.record_failure(msg)
+                    self.report_progress(msg, status="error")
+                except (PlaywrightError, TimeoutError, OSError, RuntimeError) as page_err:
+                    self.record_failure(f"Error de navegació a Veolia: {page_err}")
+                    self.report_progress(f"❌ Error navegant a Veolia: {page_err}", status="error")
                 finally:
                     browser.close()
 
-        except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as e:
-            self.record_failure(f"Error de Playwright a Agbar-Veolia: {e}")
-            self.logger.error(f"Error durant el web scraping d'Agbar-Veolia: {e}")
+        except (PlaywrightError, TimeoutError, OSError, RuntimeError) as e:
+            self.record_failure(f"Error de Playwright a Veolia: {e}")
+            self.report_progress(f"❌ Error crític de Playwright: {e}", status="error")
 
         if downloaded:
             self.record_success()
@@ -2024,13 +2319,24 @@ class VeoliaConnector(BaseConnector):
             for att in em.attachments:
                 if not att.filename.lower().endswith(".pdf"):
                     continue
-                d_str = em.date.strftime("%Y-%m-%d") if em.date else "Data desconeguda"
-                any_str = str(em.date.year) if em.date else str(date.today().year)
-                mes_str = f"{em.date.month:02d}" if em.date else "01"
 
-                clean_name = re.sub(r"[^A-Za-z0-9_-]", "_", att.filename.replace(".pdf", "").replace(".PDF", ""))
-                expected_filename = f"{any_str}_{mes_str}_{self.name}_{clean_name}.pdf"
-                parsed_amt = parse_euro_amount(em.subject) or parse_euro_amount(em.body_text) or 0.0
+                metriques = self.extract_metrics_from_pdf(att.data)
+                if metriques:
+                    any_str = str(metriques.data_emissio.year)
+                    mes_str = f"{metriques.data_emissio.month:02d}"
+                    clean_num = metriques.numero_factura.replace("/", "_").replace("\\", "_").replace(" ", "")
+                    expected_filename = f"{any_str}_{mes_str}_{self.name}_{clean_num}.pdf"
+                    d_str = str(metriques.data_emissio)
+                    parsed_amt = metriques.import_total
+                    num_display = metriques.numero_factura
+                else:
+                    d_str = em.date.strftime("%Y-%m-%d") if em.date else "Data desconeguda"
+                    any_str = str(em.date.year) if em.date else str(date.today().year)
+                    mes_str = f"{em.date.month:02d}" if em.date else "01"
+                    clean_name = re.sub(r"[^A-Za-z0-9_-]", "_", att.filename.replace(".pdf", "").replace(".PDF", ""))
+                    expected_filename = f"{any_str}_{mes_str}_{self.name}_{clean_name}.pdf"
+                    parsed_amt = parse_euro_amount(em.subject) or parse_euro_amount(em.body_text) or 0.0
+                    num_display = att.filename.replace(".pdf", "")
 
                 ja_al_nas = storage.exists(self.tipus.value, self.name, any_str, expected_filename)
                 invoices.append(
@@ -2039,7 +2345,7 @@ class VeoliaConnector(BaseConnector):
                         "proveidor": self.name,
                         "tipus": self.tipus.value,
                         "data": d_str,
-                        "numero": att.filename.replace(".pdf", ""),
+                        "numero": num_display,
                         "import": parsed_amt,
                         "subject": em.subject,
                         "exists_in_nas": ja_al_nas,
@@ -2085,17 +2391,10 @@ class VeoliaConnector(BaseConnector):
             consum_m3 = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*m[3³]")
 
         # 5. Dates del període
-        periode_raw = extract_regex_first(
+        dt_inici, dt_fi = extract_date_range(
             text,
             r"(?:Per[íi]ode\s*facturat|Per[íi]odo):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:a|fins\s*a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         )
-        dt_inici: date | None = None
-        dt_fi: date | None = None
-        if periode_raw:
-            parts = re.split(r"\s*(?:a|fins\s*a|-)\s*", periode_raw)
-            if len(parts) == 2:
-                dt_inici = parse_date_catalan_spanish(parts[0])
-                dt_fi = parse_date_catalan_spanish(parts[1])
 
         # 6. Referència o contracte
         contracte = extract_regex_first(text, r"(?:Contracte|Contrato|P[òo]lissa):?\s*([0-9A-Za-z/_-]+)")
@@ -2234,6 +2533,20 @@ class ImapMailboxClient:
                 logger.info(f"Trobats {len(mail_ids)} correus des de {since_date} a {self.folder}")
 
                 for mail_id in mail_ids:
+                    # 1. Optimització: descarregar només capçaleres per filtrar ràpidament
+                    if sender_filters:
+                        _, hdr_data = client.fetch(mail_id, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
+                        if hdr_data and hdr_data[0] and isinstance(hdr_data[0][1], bytes):
+                            hdr_msg = email.message_from_bytes(hdr_data[0][1])
+                            h_sender = decode_str(hdr_msg.get("From", "")).lower()
+                            h_subject = decode_str(hdr_msg.get("Subject", "")).lower()
+                            matches_hdr_sender = any(f.lower() in h_sender for f in sender_filters)
+                            matches_hdr_subject = any(f.lower() in h_subject for f in sender_filters)
+                            is_fwd_or_eml = "fwd:" in h_subject or "reenviat:" in h_subject or "factur" in h_subject
+                            if not matches_hdr_sender and not matches_hdr_subject and not is_fwd_or_eml:
+                                continue
+
+                    # 2. Descarregar el correu complet només dels correus candidats
                     _, msg_data = client.fetch(mail_id, "(RFC822)")
                     if not msg_data or not msg_data[0]:
                         continue
@@ -2316,8 +2629,6 @@ class ImapMailboxClient:
                             nested_id = f"{msg_id}_{filename or 'nested'}"
                             sub_parsed = self._parse_message(nested_id, sub_msg, sub_sender, sub_subject)
                             nested_emails.append(sub_parsed)
-                            # També afegim directament els seus PDFs a aquest correu
-                            attachments.extend(sub_parsed.attachments)
                             logger.info(
                                 f"Extret correu .eml adjunt: '{sub_subject}' de '{sub_sender}' ({len(sub_parsed.attachments)} PDFs)"
                             )
@@ -2376,12 +2687,9 @@ imap_client = ImapMailboxClient()
 FITXER: ./src/influx_writer.py
 
 # pyright: reportMissingImports=false
-import csv
-import io
 import logging
 from datetime import UTC, datetime, time
 
-import requests
 import urllib3.exceptions
 from influxdb_client.client.exceptions import InfluxDBError
 from influxdb_client.client.influxdb_client import InfluxDBClient
@@ -2515,36 +2823,31 @@ class InfluxMetricsWriter:
             return False
 
     def get_factures_amounts(self) -> dict[str, float]:
-        """Recupera un mapa {numero_factura: import_total} d'InfluxDB mitjançant l'API REST."""
+        """Recupera un mapa {numero_factura_lower: import_total} d'InfluxDB."""
         if not self.is_configured():
             return {}
 
-        url = f"{self.url}/api/v2/query?org={self.org}"
-        headers = {
-            "Authorization": f"Token {self.token}",
-            "Content-Type": "application/vnd.flux",
-            "Accept": "application/csv",
-        }
-        flux_body = (
-            f'from(bucket: "{self.bucket}") '
-            "|> range(start: -10y) "
-            '|> filter(fn: (r) => r["_measurement"] == "factures_subministres" and r["_field"] == "import_total")'
-        )
         result_map: dict[str, float] = {}
         try:
-            resp = requests.post(url, headers=headers, data=flux_body, timeout=4)
-            if resp.status_code == 200:
-                reader = csv.DictReader(io.StringIO(resp.text))
-                for row in reader:
-                    num = row.get("numero_factura")
-                    val_str = row.get("_value")
-                    if num and val_str:
-                        try:
-                            result_map[str(num).strip().lower()] = float(val_str)
-                        except ValueError:
-                            continue
-        except (OSError, requests.exceptions.RequestException) as err:
-            logger.debug(f"No s'ha pogut obtenir mapa d'imports d'InfluxDB via REST: {err}")
+            with InfluxDBClient(url=self.url, token=self.token, org=self.org, timeout=5000) as client:
+                tables = client.query_api().query(
+                    f'from(bucket: "{self.bucket}") '
+                    "|> range(start: -10y) "
+                    '|> filter(fn: (r) => r["_measurement"] == "factures_subministres" and r["_field"] == "import_total") '
+                    "|> last()",
+                    org=self.org,
+                )
+                for table in tables:
+                    for record in table.records:
+                        num = record.values.get("numero_factura")
+                        val = record.get_value()
+                        if num and val is not None:
+                            try:
+                                result_map[str(num).strip().lower()] = float(val)
+                            except (ValueError, TypeError):
+                                continue
+        except (InfluxDBError, urllib3.exceptions.HTTPError, OSError) as err:
+            logger.debug(f"No s'ha pogut obtenir mapa d'imports d'InfluxDB: {err}")
         return result_map
 
 
@@ -2755,6 +3058,7 @@ FITXER: ./src/pdf_parser.py
 
 # pyright: reportMissingImports=false
 import io
+import logging
 import re
 from datetime import date
 from typing import Any
@@ -2762,6 +3066,8 @@ from typing import Any
 from dateutil import parser as date_parser
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
+
+logger = logging.getLogger("pdf_parser")
 
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
@@ -2774,7 +3080,8 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
             if extracted:
                 text_parts.append(extracted)
     except (PdfReadError, OSError, ValueError) as e:
-        text_parts.append(f"Error extracting text: {e}")
+        logger.warning(f"Error extreient text del PDF: {e}")
+        return ""
     return "\n".join(text_parts)
 
 
@@ -2804,12 +3111,25 @@ def normalize_amount_str(val_str: str) -> float | None:
 
 
 def parse_euro_amount(text: str) -> float | None:
-    """Extreu el primer import en format monetari (ex: 45,67 € o 9.92€) i el converteix a float."""
-    match = re.search(r"(\d+(?:[.,]\d{1,2})?)\s*€", text)
-    if not match:
-        match = re.search(r"TOTAL[:\s]+(\d+(?:[.,]\d{1,2})?)", text, re.IGNORECASE)
-    if match:
-        return normalize_amount_str(match.group(1))
+    """Extreu l'import total monetari (ex: 45,67 € o 9.92 €) prioritzant etiquetes de total."""
+    # 1. Prioritzar etiquetes explícites de total amb decimals
+    total_patterns = [
+        r"(?:TOTAL\s+A\s+PAGAR|TOTAL\s+FACTURA|IMPORT\s+TOTAL|IMPORTE\s+TOTAL)[^0-9]{0,40}?(\d{1,4}[.,]\d{2})\s*€",
+        r"(\d{1,4}[.,]\d{2})\s*€\s*(?:TOTAL\s+FACTURA|TOTAL\s+A\s+PAGAR)",
+        r"TOTAL[:\s]+(\d{1,4}[.,]\d{2})\s*€?",
+    ]
+    for pat in total_patterns:
+        match = re.search(pat, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            val = normalize_amount_str(match.group(1))
+            if val is not None:
+                return val
+
+    # 2. Fallback: cercar imports amb decimals explícits seguits de €
+    matches = re.findall(r"(\d{1,4}[.,]\d{2})\s*€", text)
+    if matches:
+        # En moltes factures l'import total és l'últim o el més rellevant amb decimals
+        return normalize_amount_str(matches[-1])
     return None
 
 
@@ -2855,6 +3175,16 @@ def extract_regex_first(text: str, pattern: str, group: int = 1) -> str | None:
     """Cerca un patró regex i retorna el grup capturat o None."""
     m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
     return m.group(group).strip() if m else None
+
+
+def extract_date_range(text: str, pattern: str) -> tuple[date | None, date | None]:
+    """Cerca un patró regex amb dos grups de captura de data i retorna (data_inici, data_fi)."""
+    m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+    if m and len(m.groups()) >= 2:
+        dt_inici = parse_date_catalan_spanish(m.group(1).strip())
+        dt_fi = parse_date_catalan_spanish(m.group(2).strip())
+        return dt_inici, dt_fi
+    return None, None
 
 
 def extract_float_value(text: str, pattern: str, group: int = 1) -> float | None:
@@ -2931,8 +3261,9 @@ class StorageManager:
 
     def delete_pdf(self, rel_path: str) -> bool:
         """Elimina un fitxer del NAS Samba de forma segura."""
-        target = (self.base_path / rel_path).resolve()
-        if not str(target).startswith(str(self.base_path.resolve())) or not target.exists():
+        base_resolved = self.base_path.resolve()
+        target = (base_resolved / rel_path).resolve()
+        if not target.is_relative_to(base_resolved) or not target.is_file():
             return False
         if settings.DRY_RUN:
             logger.info(f"[DRY-RUN] S'eliminaria el fitxer a: {target}")
@@ -2950,11 +3281,14 @@ FITXER: ./src/web/app.py
 # pyright: reportMissingImports=false
 import asyncio
 import email
+import html
 import io
 import logging
 import os
+import re
 import zipfile
 from collections import deque
+from contextlib import asynccontextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated, Any
@@ -3023,6 +3357,20 @@ class ConnectionManager:
             except (WebSocketDisconnect, ConnectionResetError, OSError):
                 self.disconnect(ws)
 
+    async def broadcast_status(self, payload: dict[str, Any]) -> None:
+        for ws in list(self.active_connections):
+            try:
+                await ws.send_json({"type": "status", **payload})
+            except (WebSocketDisconnect, ConnectionResetError, OSError):
+                self.disconnect(ws)
+
+    async def broadcast_progress(self, payload: dict[str, Any]) -> None:
+        for ws in list(self.active_connections):
+            try:
+                await ws.send_json({"type": "progress", **payload})
+            except (WebSocketDisconnect, ConnectionResetError, OSError):
+                self.disconnect(ws)
+
 
 ws_manager = ConnectionManager()
 
@@ -3039,9 +3387,11 @@ class WebLogHandler(logging.Handler):
             return
 
 
+root_logger = logging.getLogger()
+root_logger.setLevel(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
 web_handler = WebLogHandler()
 web_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] (%(name)s) %(message)s", "%H:%M:%S"))
-logging.getLogger().addHandler(web_handler)
+root_logger.addHandler(web_handler)
 
 
 # Silenciar el polling continu de /api/logs dels access logs d'Uvicorn
@@ -3052,7 +3402,16 @@ class EndpointFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
-app = FastAPI(title="Subministres ETL", version=settings.APP_VERSION)
+
+@asynccontextmanager
+async def lifespan(fastapi_app: FastAPI):
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+    await asyncio.to_thread(auto_annotate_k8s_pod)
+    yield
+
+
+app = FastAPI(title="Subministres ETL", version=settings.APP_VERSION, lifespan=lifespan)
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -3097,13 +3456,6 @@ def auto_annotate_k8s_pod() -> None:
         logger.warning(f"Error intentant auto-anotar el Pod a Kubernetes: {err}")
 
 
-@app.on_event("startup")
-async def startup_event() -> None:
-    global main_loop
-    main_loop = asyncio.get_running_loop()
-    auto_annotate_k8s_pod()
-
-
 # Estat d'execució global
 execution_state: dict[str, Any] = {
     "is_running": False,
@@ -3114,13 +3466,16 @@ execution_state: dict[str, Any] = {
 }
 
 
-def get_all_connectors_map():
-    return {
-        "veolia": VeoliaConnector(),
-        "catgas": CatgasConnector(),
-        "bonpreu": BonpreuConnector(),
-        "digi": DigiConnector(),
-    }
+CONNECTORS_MAP: dict[str, Any] = {
+    "veolia": VeoliaConnector(),
+    "catgas": CatgasConnector(),
+    "bonpreu": BonpreuConnector(),
+    "digi": DigiConnector(),
+}
+
+
+def get_all_connectors_map() -> dict[str, Any]:
+    return CONNECTORS_MAP
 
 
 MESOS_CATALANS = {
@@ -3137,6 +3492,10 @@ MESOS_CATALANS = {
     "11": "Nov",
     "12": "Des",
 }
+
+
+# Memòria cau per no re-parsejar els PDFs del NAS a cada recàrrega de pàgina
+_pdf_amount_cache: dict[str, tuple[float, float]] = {}  # rel_path -> (mtime, amount)
 
 
 def list_nas_invoices() -> list[dict[str, Any]]:
@@ -3181,12 +3540,23 @@ def list_nas_invoices() -> list[dict[str, Any]]:
 
             import_val = amounts_map.get(num_clean) or amounts_map.get(pdf_path.stem.lower())
             if import_val is None:
-                try:
-                    pdf_data = pdf_path.read_bytes()
-                    txt = extract_text_from_pdf_bytes(pdf_data)
-                    import_val = parse_euro_amount(txt)
-                except (OSError, RuntimeError, ValueError):
-                    pass
+                cached = _pdf_amount_cache.get(str(rel_path))
+                if cached and cached[0] == stat.st_mtime:
+                    import_val = cached[1]
+                else:
+                    try:
+                        pdf_data = pdf_path.read_bytes()
+                        conn = CONNECTORS_MAP.get(proveidor.lower())
+                        metriques = conn.extract_metrics_from_pdf(pdf_data) if conn else None
+                        if metriques and metriques.import_total is not None:
+                            import_val = metriques.import_total
+                        else:
+                            txt = extract_text_from_pdf_bytes(pdf_data)
+                            import_val = parse_euro_amount(txt)
+                        if import_val is not None:
+                            _pdf_amount_cache[str(rel_path)] = (stat.st_mtime, import_val)
+                    except (OSError, RuntimeError, ValueError):
+                        pass
 
             if import_val is not None:
                 import_str = f"{import_val:.2f} €"
@@ -3221,12 +3591,17 @@ def run_sync_task(
     connector_name: str | None = None,
     mode: str = "normal",
     limit: int | None = None,
+    source: str = "auto",
 ) -> None:
-    """Tasca d'execució d'ETL llançada en segon pla."""
+    """Tasca d'execució d'ETL amb emissió de progrés (X/N) i diagnòstic en temps real."""
+    source_label = {"email": "📧 Correu IMAP", "portal": "🌐 Portal Web", "auto": "⚡ Híbrid"}.get(source, source)
     execution_state["is_running"] = True
-    execution_state["active_connector"] = f"{connector_name or 'Tots'} ({mode})"
+    execution_state["active_connector"] = f"{(connector_name or 'Tots').upper()} ({source_label})"
     execution_state["last_status"] = "Sincronitzant..."
-    logger.info(f"Iniciant sincronització sota demanda: {execution_state['active_connector']}")
+
+    def _emit_progress(data: dict[str, Any]) -> None:
+        if main_loop and main_loop.is_running():
+            asyncio.run_coroutine_threadsafe(ws_manager.broadcast_progress(data), main_loop)
 
     connectors_map = get_all_connectors_map()
     if connector_name and connector_name.lower() in connectors_map:
@@ -3235,32 +3610,70 @@ def run_sync_task(
         to_run = [c for c in connectors_map.values() if c.is_enabled()]
 
     results: list[FacturaResult] = []
-    has_errors = False
+    error_messages: list[str] = []
 
     for conn in to_run:
-        logger.info(f"Executant connector: {conn.name.upper()} (mode={mode})")
+        conn.progress_callback = _emit_progress
         try:
-            res = conn.run(imap_client, mode=mode, limit=limit)
+            _emit_progress(
+                {
+                    "connector": conn.name.upper(),
+                    "step": f"Iniciant extracció ({source_label})...",
+                    "current": 0,
+                    "total": 0,
+                    "percent": 0,
+                    "status": "running",
+                }
+            )
+            res = conn.run(imap_client, mode=mode, limit=limit, source=source)
             results.extend(res)
             for r in res:
                 if r.errors:
-                    has_errors = True
+                    error_messages.extend(r.errors)
         except (OSError, RuntimeError, ValueError) as err:
-            logger.error(f"Error executant connector {conn.name}: {err}")
-            has_errors = True
+            err_str = f"{conn.name.upper()}: {err}"
+            logger.error(f"❌ Error executant {err_str}")
+            error_messages.append(err_str)
+        finally:
+            conn.progress_callback = None
+
+    noves = sum(1 for r in results if r.nou_descarregat)
+    existents = len(results) - noves
 
     execution_state["is_running"] = False
     execution_state["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    execution_state["last_status"] = "Error" if has_errors else "Completat"
+    execution_state["last_status"] = "Error" if error_messages else "Completat"
     execution_state["last_results"] = [r.model_dump() for r in results]
     execution_state["active_connector"] = None
-    logger.info(f"Sincronització finalitzada amb estat: {execution_state['last_status']}")
+
+    if error_messages:
+        summary_msg = f"❌ Finalitzat amb errors ({source_label}): {'; '.join(error_messages)}"
+        status_code = "error"
+    elif len(results) == 0:
+        summary_msg = (
+            f"⚠️ Procés finalitzat ({source_label}): 0 factures obtingudes. "
+            "Revisa la consola de logs inferior per veure el detall."
+        )
+        status_code = "warning"
+    else:
+        summary_msg = (
+            f"✅ Completat ({source_label}): {len(results)} factures processades "
+            f"({noves} noves desades al NAS, {existents} ja existents)."
+        )
+        status_code = "ok"
+
+    logger.info(summary_msg)
+    if main_loop and main_loop.is_running():
+        asyncio.run_coroutine_threadsafe(
+            ws_manager.broadcast_status({"status": status_code, "message": summary_msg, "new_count": noves}),
+            main_loop,
+        )
 
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Pàgina principal amb dashboard operatiu i controls."""
-    invoices = list_nas_invoices()
+    invoices = await asyncio.to_thread(list_nas_invoices)
 
     # Calcular darrera factura per proveïdor
     last_by_provider: dict[str, str] = {}
@@ -3327,37 +3740,59 @@ async def index(request: Request):
 
 
 @app.post("/api/sync")
-async def trigger_sync(background_tasks: BackgroundTasks, connector: str = Form(default="")):
-    """Dispara la sincronització en segon pla."""
+async def trigger_sync(
+    background_tasks: BackgroundTasks,
+    connector: str = Form(default=""),
+    mode: str = Form(default="normal"),
+    source: str = Form(default="auto"),
+):
+    """Dispara la sincronització en segon pla podent triar source ('email', 'portal' o 'auto')."""
     if execution_state["is_running"]:
         return HTMLResponse(
-            '<div class="p-4 mb-4 text-sm text-yellow-800 rounded-lg bg-yellow-50 dark:bg-gray-800 dark:text-yellow-300" role="alert">'
-            "Ja hi ha una sincronització en curs. Si us plau, espera que finalitzi.</div>"
+            '<div class="p-4 mb-4 text-sm text-yellow-300 rounded-xl bg-yellow-950/60 border border-yellow-700/50">'
+            "⚠️ Ja hi ha una sincronització en curs. Mira el panell de progrés superior.</div>"
         )
 
     target = connector.strip() if connector else None
-    background_tasks.add_task(run_sync_task, target)
+    sync_mode = mode.strip() if mode else "normal"
+    sync_source = source.strip() if source else "auto"
+    limit = 1 if sync_mode == "latest" else None
 
-    target_desc = f"del proveïdor {target.upper()}" if target else "de tots els proveïdors"
+    background_tasks.add_task(run_sync_task, target, mode=sync_mode, limit=limit, source=sync_source)
+
+    target_escaped = html.escape(target.upper()) if target else "TOTS ELS PROVEÏDORS"
+    source_desc = {"email": "📧 Correu IMAP", "portal": "🌐 Portal Web", "auto": "⚡ Automàtic"}.get(
+        sync_source, sync_source
+    )
     return HTMLResponse(
-        f'<div class="p-4 mb-4 text-sm text-green-800 rounded-lg bg-green-50 dark:bg-gray-800 dark:text-green-400" role="alert">'
-        f"🚀 Sincronització iniciada {target_desc} en segon pla. Els logs s'estan actualitzant a continuació.</div>"
+        f'<div class="p-4 mb-4 rounded-xl bg-slate-900 border border-blue-700/60 shadow-lg space-y-2">'
+        f'  <div class="flex items-center justify-between text-xs font-semibold text-blue-300">'
+        f'    <span id="live-progress-title">⏳ {target_escaped} ({source_desc}) — Iniciant...</span>'
+        f'    <span id="live-progress-counter" class="font-mono text-emerald-400">Connectant...</span>'
+        f"  </div>"
+        f'  <div class="w-full bg-slate-800 rounded-full h-2 overflow-hidden">'
+        f'    <div id="live-progress-bar" class="bg-emerald-500 h-2 rounded-full transition-all duration-300 animate-pulse" style="width: 10%"></div>'
+        f"  </div>"
+        f'  <p id="live-progress-step" class="text-xs text-slate-300 font-mono truncate">Esperant resposta del connector...</p>'
+        f"</div>"
     )
 
 
 @app.websocket("/ws/logs")
 async def websocket_logs_endpoint(websocket: WebSocket):
-    """Canal WebSocket bidireccional per transmetre logs en temps real i sincronització de versió."""
+    """Canal WebSocket amb heartbeat automàtic per transmetre logs, progrés X/N i estat."""
     await ws_manager.connect(websocket)
     try:
         # 1. Enviar la versió actual del servidor per al version-check del frontend
         await websocket.send_json({"type": "version", "version": f"v{settings.APP_VERSION}"})
         # 2. Enviar els darrers logs acumulats per a la càrrega inicial
-        for line in list(log_buffer)[-40:]:
+        for line in list(log_buffer)[-60:]:
             await websocket.send_json({"type": "log", "line": line})
         while True:
-            # Manté la connexió oberta
-            await websocket.receive_text()
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=20.0)
+            except TimeoutError:
+                await websocket.send_json({"type": "ping"})
     except (WebSocketDisconnect, ConnectionResetError, OSError):
         ws_manager.disconnect(websocket)
 
@@ -3378,7 +3813,7 @@ async def get_logs_fragment():
             color = "text-yellow-300"
         elif "OK" in line or "correctament" in line or "desada" in line:
             color = "text-emerald-400"
-        html_lines.append(f'<div class="{color} py-0.5">{line}</div>')
+        html_lines.append(f'<div class="{color} py-0.5">{html.escape(line)}</div>')
 
     is_running_badge = ""
     if execution_state["is_running"]:
@@ -3405,7 +3840,12 @@ async def trigger_sync_latest(
     target = connector.strip() if connector else None
     background_tasks.add_task(run_sync_task, target, mode="latest", limit=1)
 
-    desc = f"de l'última factura de {target.upper()}" if target else "de les últimes factures de tots els proveïdors"
+    target_escaped = html.escape(target.upper()) if target else None
+    desc = (
+        f"de l'última factura de {target_escaped}"
+        if target_escaped
+        else "de les últimes factures de tots els proveïdors"
+    )
     return HTMLResponse(
         f'<div class="p-4 mb-4 text-sm text-emerald-800 rounded-lg bg-emerald-50 dark:bg-gray-800 dark:text-emerald-400">'
         f"⚡ Cerca ràpida iniciada {desc}. Si ja és al NAS, no es duplicarà.</div>"
@@ -3414,13 +3854,13 @@ async def trigger_sync_latest(
 
 @app.get("/api/history/{connector}")
 async def get_connector_history(connector: str):
-    """Consulta les factures històriques disponibles i en retorna el fragment per al modal."""
+    """Consulta les factures històriques disponibles sense bloquejar l'event loop."""
     connectors = get_all_connectors_map()
     conn = connectors.get(connector.lower())
     if not conn:
         raise HTTPException(status_code=404, detail=f"Proveïdor '{connector}' desconegut.")
 
-    invoices = conn.fetch_available_invoices(imap_client)
+    invoices = await asyncio.to_thread(conn.fetch_available_invoices, imap_client)
     pendents = [inv for inv in invoices if not inv.get("exists_in_nas", False)]
 
     # Renderitzem el fragment HTML per al modal
@@ -3434,13 +3874,17 @@ async def get_connector_history(connector: str):
         )
         checked = "" if exists else "checked"
 
+        inv_id = html.escape(str(inv.get("id", "")))
+        inv_data = html.escape(str(inv.get("data", "-")))
+        inv_num = html.escape(str(inv.get("numero", "-")))
+
         html_items.append(
             f'<tr class="border-b border-slate-800/60 hover:bg-slate-800/30">'
             f'<td class="py-2.5 px-3">'
-            f'<input type="checkbox" name="selected_invoices" value="{inv.get("id")}" {checked} class="bulk-cb rounded bg-slate-900 border-slate-700 text-emerald-600 focus:ring-emerald-500">'
+            f'<input type="checkbox" name="selected_invoices" value="{inv_id}" {checked} class="bulk-cb rounded bg-slate-900 border-slate-700 text-emerald-600 focus:ring-emerald-500">'
             f"</td>"
-            f'<td class="py-2.5 px-3 font-mono text-xs text-white">{inv.get("data", "-")}</td>'
-            f'<td class="py-2.5 px-3 text-xs text-slate-300 font-mono truncate max-w-[200px]" title="{inv.get("numero", "")}">{inv.get("numero", "-")}</td>'
+            f'<td class="py-2.5 px-3 font-mono text-xs text-white">{inv_data}</td>'
+            f'<td class="py-2.5 px-3 text-xs text-slate-300 font-mono truncate max-w-[200px]" title="{inv_num}">{inv_num}</td>'
             f'<td class="py-2.5 px-3 text-xs font-semibold text-emerald-400 text-right">{inv.get("import", 0.0):.2f} €</td>'
             f'<td class="py-2.5 px-3 text-center">{badge}</td>'
             f"</tr>"
@@ -3468,39 +3912,41 @@ async def get_connector_history(connector: str):
         </button>
       </div>
 
-      <!-- Accions ràpides KISS -->
-      <div class="flex flex-wrap items-center justify-between gap-3 bg-slate-950/60 p-3 rounded-xl border border-slate-800">
-        <div class="flex items-center gap-2 text-xs">
-          <button type="button" onclick="toggleAllCheckboxes(true)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700">Seleccionar Tot</button>
-          <button type="button" onclick="toggleAllCheckboxes(false)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700">Deseleccionar</button>
-          <button type="button" onclick="selectOnlyPending()" class="px-2.5 py-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 rounded-lg border border-amber-500/30">Només Pendents</button>
-        </div>
+      <form id="history-sync-form" hx-post="/api/sync" hx-target="#notification-area" onsubmit="closeHistoryModal()" class="space-y-4">
+        <input type="hidden" name="connector" value="{conn.name}">
+        <input type="hidden" name="mode" value="all">
 
-        <form hx-post="/api/sync" hx-target="#notification-area" onclick="closeHistoryModal()" class="flex items-center gap-2">
-          <input type="hidden" name="connector" value="{conn.name}">
+        <!-- Accions ràpides KISS -->
+        <div class="flex flex-wrap items-center justify-between gap-3 bg-slate-950/60 p-3 rounded-xl border border-slate-800">
+          <div class="flex items-center gap-2 text-xs">
+            <button type="button" onclick="toggleAllCheckboxes(true)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700">Seleccionar Tot</button>
+            <button type="button" onclick="toggleAllCheckboxes(false)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700">Deseleccionar</button>
+            <button type="button" onclick="selectOnlyPending()" class="px-2.5 py-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 rounded-lg border border-amber-500/30">Només Pendents</button>
+          </div>
+
           <button type="submit" class="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-lg shadow transition flex items-center gap-1.5">
             <span>📥 Sincronitzar Tot l'Històric</span>
           </button>
-        </form>
-      </div>
+        </div>
 
-      <!-- Taula de factures -->
-      <div class="max-h-72 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/40">
-        <table class="w-full text-left border-collapse">
-          <thead class="sticky top-0 bg-slate-900 border-b border-slate-800 text-[11px] text-slate-400 uppercase tracking-wider">
-            <tr>
-              <th class="py-2.5 px-3 w-8"></th>
-              <th class="py-2.5 px-3">Data</th>
-              <th class="py-2.5 px-3">Factura</th>
-              <th class="py-2.5 px-3 text-right">Import</th>
-              <th class="py-2.5 px-3 text-center">Estat al NAS</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows_html}
-          </tbody>
-        </table>
-      </div>
+        <!-- Taula de factures -->
+        <div class="max-h-72 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/40">
+          <table class="w-full text-left border-collapse">
+            <thead class="sticky top-0 bg-slate-900 border-b border-slate-800 text-[11px] text-slate-400 uppercase tracking-wider">
+              <tr>
+                <th class="py-2.5 px-3 w-8"></th>
+                <th class="py-2.5 px-3">Data</th>
+                <th class="py-2.5 px-3">Factura</th>
+                <th class="py-2.5 px-3 text-right">Import</th>
+                <th class="py-2.5 px-3 text-center">Estat al NAS</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows_html}
+            </tbody>
+          </table>
+        </div>
+      </form>
     </div>
     """
     return HTMLResponse(modal_html)
@@ -3568,6 +4014,9 @@ def extract_pdfs_from_eml(eml_bytes: bytes) -> list[tuple[bytes, str, str | None
     return results
 
 
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # Límit màxim de 50 MB per seguretat
+
+
 @app.post("/api/upload")
 async def upload_invoice_files(
     file: Annotated[UploadFile, File()],
@@ -3584,9 +4033,11 @@ async def upload_invoice_files(
             detail="Format no admès. Només es permeten fitxers .pdf, .eml o .zip.",
         )
 
-    content = await file.read()
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(content) == 0:
         raise HTTPException(status_code=400, detail="El fitxer és buit.")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="El fitxer supera el límit màxim de 50 MB.")
 
     connectors = get_all_connectors_map()
 
@@ -3598,7 +4049,7 @@ async def upload_invoice_files(
         try:
             with zipfile.ZipFile(io.BytesIO(content)) as z:
                 for zinfo in z.infolist():
-                    if zinfo.is_dir():
+                    if zinfo.is_dir() or zinfo.file_size > MAX_UPLOAD_BYTES:
                         continue
                     inner_name = zinfo.filename.lower()
                     if inner_name.endswith(".pdf"):
@@ -3670,9 +4121,9 @@ async def upload_invoice_files(
 @app.get("/api/pdf/view/{rel_path:path}")
 async def view_pdf(rel_path: str):
     """Serveix el PDF inline per obrir-lo al visor integrat del navegador."""
-    full_path = (Path(settings.NAS_MOUNT_PATH) / rel_path).resolve()
-    # Validació de seguretat path traversal
-    if not str(full_path).startswith(str(Path(settings.NAS_MOUNT_PATH).resolve())) or not full_path.exists():
+    base_resolved = Path(settings.NAS_MOUNT_PATH).resolve()
+    full_path = (base_resolved / rel_path).resolve()
+    if not full_path.is_relative_to(base_resolved) or not full_path.is_file():
         raise HTTPException(status_code=404, detail="Factura no trobada.")
 
     return FileResponse(
@@ -3685,8 +4136,9 @@ async def view_pdf(rel_path: str):
 @app.get("/api/pdf/download/{rel_path:path}")
 async def download_pdf(rel_path: str):
     """Descarrega el PDF directament."""
-    full_path = (Path(settings.NAS_MOUNT_PATH) / rel_path).resolve()
-    if not str(full_path).startswith(str(Path(settings.NAS_MOUNT_PATH).resolve())) or not full_path.exists():
+    base_resolved = Path(settings.NAS_MOUNT_PATH).resolve()
+    full_path = (base_resolved / rel_path).resolve()
+    if not full_path.is_relative_to(base_resolved) or not full_path.is_file():
         raise HTTPException(status_code=404, detail="Factura no trobada.")
 
     return FileResponse(
@@ -3701,17 +4153,20 @@ async def delete_invoice(rel_path: str):
     """Elimina una factura del NAS Samba i suprimeix les mètriques d'InfluxDB per evitar dades errònies a Grafana."""
     parts = Path(rel_path).parts
     proveidor = parts[1] if len(parts) > 1 else ""
-    filename = Path(rel_path).name
 
-    # Deduïm el número de factura
-    numero_factura = filename.replace(".pdf", "").replace(".PDF", "")
+    # Deduïm el número de factura preservant majúscules/minúscules
+    stem = Path(rel_path).stem
+    numero_factura = stem
     for p in ["bonpreu", "digi", "veolia", "catgas"]:
-        if f"_{p}_" in numero_factura.lower():
-            numero_factura = numero_factura.lower().split(f"_{p}_", 1)[1]
+        match = re.split(rf"_{p}_", stem, maxsplit=1, flags=re.IGNORECASE)
+        if len(match) == 2:
+            numero_factura = match[1]
             break
 
-    # 1. Eliminar del NAS
+    # 1. Eliminar del NAS i de la memòria cau
     deleted_nas = storage.delete_pdf(rel_path)
+    _pdf_amount_cache.pop(rel_path, None)
+    _pdf_amount_cache.pop(rel_path.replace("/", "\\"), None)
 
     # 2. Eliminar d'InfluxDB
     deleted_influx = False
@@ -3874,27 +4329,40 @@ FITXER: ./src/web/templates/index.html
             </div>
           </div>
 
-          <div class="pt-4 border-t border-slate-800/80 mt-2 grid grid-cols-2 gap-2">
-            <!-- Botó 1: Última factura ràpida (KISS) -->
-            <button 
-              hx-post="/api/sync/latest" 
-              hx-vals='{"connector": "{{ card.id }}"}'
-              hx-target="#notification-area"
-              title="Cerca només la darrera factura disponible (no la descarrega si ja és al NAS)"
-              class="flex items-center justify-center gap-1.5 py-2 px-2.5 bg-emerald-950/60 hover:bg-emerald-900/80 text-emerald-300 text-xs font-semibold rounded-xl border border-emerald-800/60 transition shadow-sm">
-              <i data-lucide="zap" class="w-3.5 h-3.5 text-emerald-400"></i>
-              <span>Última</span>
-            </button>
+          <div class="pt-4 border-t border-slate-800/80 mt-2 space-y-2">
+            <div class="grid grid-cols-2 gap-2">
+              <!-- Botó 1: Cercar per Correu (IMAP) -->
+              <button 
+                hx-post="/api/sync" 
+                hx-vals='{"connector": "{{ card.id }}", "mode": "normal", "source": "email"}'
+                hx-target="#notification-area"
+                title="Cerca factures als correus electrònics rebuts (IMAP)"
+                class="flex items-center justify-center gap-1.5 py-2 px-2 bg-blue-950/60 hover:bg-blue-900/80 text-blue-300 text-xs font-semibold rounded-xl border border-blue-800/60 transition shadow-sm">
+                <i data-lucide="mail" class="w-3.5 h-3.5 text-blue-400"></i>
+                <span>Correu</span>
+              </button>
 
-            <!-- Botó 2: Explorador Històric & Bulk -->
+              <!-- Botó 2: Fer Scraping al Portal Web -->
+              <button 
+                hx-post="/api/sync" 
+                hx-vals='{"connector": "{{ card.id }}", "mode": "normal", "source": "portal"}'
+                hx-target="#notification-area"
+                title="Entra al portal web de la companyia amb Playwright i descarrega els PDFs"
+                class="flex items-center justify-center gap-1.5 py-2 px-2 bg-emerald-950/60 hover:bg-emerald-900/80 text-emerald-300 text-xs font-semibold rounded-xl border border-emerald-800/60 transition shadow-sm">
+                <i data-lucide="globe" class="w-3.5 h-3.5 text-emerald-400"></i>
+                <span>Portal Web</span>
+              </button>
+            </div>
+
+            <!-- Botó 3: Explorador Històric & Bulk -->
             <button 
               hx-get="/api/history/{{ card.id }}"
               hx-target="#history-modal-content"
               onclick="openHistoryModal()"
               title="Explora tot l'històric disponible i tria quines descarregar"
-              class="flex items-center justify-center gap-1.5 py-2 px-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-xl border border-slate-700 transition">
-              <i data-lucide="history" class="w-3.5 h-3.5 text-blue-400"></i>
-              <span>Històric</span>
+              class="w-full flex items-center justify-center gap-1.5 py-1.5 px-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium rounded-xl border border-slate-700 transition">
+              <i data-lucide="history" class="w-3.5 h-3.5 text-amber-400"></i>
+              <span>Explorar Històric (730 dies)</span>
             </button>
           </div>
         </div>
@@ -3990,7 +4458,7 @@ FITXER: ./src/web/templates/index.html
 
       <div class="overflow-x-auto max-h-[360px] overflow-y-auto">
         <table class="w-full text-left text-xs text-slate-300" id="invoices-table">
-          <thead class="bg-slate-950/80 text-slate-400 uppercase text-[10px] tracking-wider sticky top-0 select-none">
+          <thead class="bg-slate-950 text-slate-400 uppercase text-[10px] tracking-wider sticky top-0 z-10 border-b border-slate-800 select-none">
             <tr>
               <th onclick="sortTable(0)" class="py-3 px-4 cursor-pointer hover:text-white transition">Proveïdor <span class="sort-icon text-[9px] text-slate-500">↕</span></th>
               <th onclick="sortTable(1)" class="py-3 px-4 cursor-pointer hover:text-white transition">Tipus <span class="sort-icon text-[9px] text-slate-500">↕</span></th>
@@ -4041,7 +4509,7 @@ FITXER: ./src/web/templates/index.html
             </tr>
             {% else %}
             <tr>
-              <td colspan="7" class="py-8 text-center text-slate-500 font-sans">
+              <td colspan="9" class="py-8 text-center text-slate-500 font-sans">
                 Encara no hi ha cap factura guardada al NAS. Executa una sincronització per començar.
               </td>
             </tr>
@@ -4421,6 +4889,82 @@ FITXER: ./src/web/templates/index.html
           try {
             const data = JSON.parse(event.data);
 
+            if (data.type === 'ping') return;
+
+            // A) Progrés pas a pas en temps real (ex: 3/40 o avís de timeout)
+            if (data.type === 'progress') {
+              const notif = document.querySelector('#notification-area');
+              if (notif && !document.querySelector('#live-progress-bar')) {
+                while (notif.firstChild) notif.removeChild(notif.firstChild);
+                const box = document.createElement('div');
+                box.className = 'p-4 mb-4 rounded-xl bg-slate-900 border border-blue-700/60 shadow-lg space-y-2';
+
+                const header = document.createElement('div');
+                header.className = 'flex items-center justify-between text-xs font-semibold text-blue-300';
+                const titleEl = document.createElement('span');
+                titleEl.id = 'live-progress-title';
+                titleEl.textContent = `⏳ Executant ${data.connector || 'ETL'}...`;
+                const counterEl = document.createElement('span');
+                counterEl.id = 'live-progress-counter';
+                counterEl.className = 'font-mono text-emerald-400';
+                header.appendChild(titleEl);
+                header.appendChild(counterEl);
+
+                const track = document.createElement('div');
+                track.className = 'w-full bg-slate-800 rounded-full h-2 overflow-hidden';
+                const barEl = document.createElement('div');
+                barEl.id = 'live-progress-bar';
+                barEl.className = 'bg-emerald-500 h-2 rounded-full transition-all duration-300';
+                barEl.style.width = '10%';
+                track.appendChild(barEl);
+
+                const stepEl = document.createElement('p');
+                stepEl.id = 'live-progress-step';
+                stepEl.className = 'text-xs text-slate-300 font-mono truncate';
+
+                box.appendChild(header);
+                box.appendChild(track);
+                box.appendChild(stepEl);
+                notif.appendChild(box);
+              }
+              const titleEl = document.querySelector('#live-progress-title');
+              const counterEl = document.querySelector('#live-progress-counter');
+              const barEl = document.querySelector('#live-progress-bar');
+              const stepEl = document.querySelector('#live-progress-step');
+
+              if (titleEl && data.connector) titleEl.textContent = `⏳ Processant ${data.connector}...`;
+              if (stepEl && data.step) stepEl.textContent = data.step;
+              if (counterEl) {
+                counterEl.textContent = data.total > 0 ? `${data.current} / ${data.total} (${data.percent}%)` : 'En curs...';
+              }
+              if (barEl) {
+                barEl.style.width = (data.total > 0 ? Math.max(8, data.percent) : 25) + '%';
+                if (data.status === 'warning') barEl.className = 'bg-amber-500 h-2 rounded-full transition-all duration-300';
+                else if (data.status === 'error') barEl.className = 'bg-red-500 h-2 rounded-full transition-all duration-300';
+                else barEl.className = 'bg-emerald-500 h-2 rounded-full transition-all duration-300';
+              }
+            }
+
+            // B) Resultat Final d'Execució (OK / Warning / Error)
+            if (data.type === 'status' && data.message) {
+              const notif = document.querySelector('#notification-area');
+              if (notif) {
+                while (notif.firstChild) notif.removeChild(notif.firstChild);
+                const statusBox = document.createElement('div');
+                let styles = 'text-blue-300 bg-blue-950/60 border-blue-700/50';
+                if (data.status === 'error') styles = 'text-red-300 bg-red-950/70 border-red-700/60';
+                else if (data.status === 'warning') styles = 'text-amber-300 bg-amber-950/70 border-amber-700/60';
+                else if (data.status === 'ok') styles = 'text-emerald-300 bg-emerald-950/70 border-emerald-700/60';
+
+                statusBox.className = `p-4 mb-4 text-sm rounded-xl border ${styles} font-medium shadow`;
+                statusBox.textContent = data.message;
+                notif.appendChild(statusBox);
+                if (data.new_count && data.new_count > 0) {
+                  setTimeout(() => window.location.reload(), 2000);
+                }
+              }
+            }
+
             // 1. Sincronització de Versió del Servidor
             if (data.type === 'version' && data.version) {
               if (CURRENT_VERSION && data.version !== CURRENT_VERSION) {
@@ -4493,6 +5037,6 @@ FITXER: ./src/__init__.py
 
 """ETL de factures de subministraments domèstics."""
 
-__version__ = "0.1.0"
+__version__ = "0.15.0"
 
 

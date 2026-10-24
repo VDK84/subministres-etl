@@ -113,7 +113,7 @@ class VeoliaConnector(BaseConnector):
                     raise RuntimeError(msg)
                 return results
 
-            pdf_list = self.fetch_invoices_from_portal(limit=fetch_limit)
+            pdf_list = self.fetch_invoices_from_portal(limit=fetch_limit, imap_client=imap_client)
             total_dl = len(pdf_list)
             for idx, (pdf_bytes, filename) in enumerate(pdf_list, start=1):
                 self.report_progress(
@@ -128,8 +128,13 @@ class VeoliaConnector(BaseConnector):
 
         return results
 
-    def fetch_invoices_from_portal(self, limit: int | None = 3) -> list[tuple[bytes, str]]:
-        """Autenticació al portal d'Agbar/Veolia via Playwright amb traçabilitat pas a pas."""
+    def fetch_invoices_from_portal(
+        self,
+        limit: int | None = 3,
+        otp_code: str | None = None,
+        imap_client: ImapMailboxClient | None = None,
+    ) -> list[tuple[bytes, str]]:
+        """Autenticació al portal d'Agbar/Veolia via Playwright, suport 2FA i descàrrega de factures."""
         downloaded: list[tuple[bytes, str]] = []
         if self.is_in_cooldown():
             return downloaded
@@ -158,7 +163,7 @@ class VeoliaConnector(BaseConnector):
                     context = browser.new_context(**context_kwargs)
                     page = context.new_page()
 
-                    # 1. Obrir portal (domcontentloaded per evitar bloqueig per scripts d'analítica)
+                    # 1. Obrir llistat de factures
                     self.report_progress(f"🌐 Obrint portal Veolia ({self.PORTAL_INVOICES_URL})...")
                     page.goto(
                         self.PORTAL_INVOICES_URL,
@@ -179,27 +184,44 @@ class VeoliaConnector(BaseConnector):
                     except PlaywrightError:
                         pass
 
-                    # 2. Comprovar si cal fer login
-                    login_input = page.query_selector(
-                        "input#login, input[name*='login'], input[type='email'], input[name='username']"
+                    # 2. Comprovar si estem autenticats o si cal fer login
+                    is_authenticated = (
+                        "mis-facturas" in page.url.lower()
+                        and "inicio" not in page.url.lower()
+                        and page.query_selector(
+                            "a[data-test-id='verDetalleFactura'], a[href*='/misfacturas/view/'], a[data-testid='icon-perfil'], #profile-dialog, #load-mas-facturas"
+                        )
+                        is not None
                     )
-                    pass_input = page.query_selector("input#password, input[name*='password'], input[type='password']")
 
-                    if "login" in page.url.lower() or (login_input and pass_input):
-                        self.report_progress(f"🔑 Sessió no activa. Autenticant usuari '{settings.VEOLIA_USER}'...")
-                        if not login_input or not pass_input:
-                            page.goto(
-                                self.PORTAL_LOGIN_URL,
-                                wait_until="domcontentloaded",
-                                timeout=settings.SCRAPER_TIMEOUT_MS,
+                    if not is_authenticated:
+                        self.report_progress(f"🔑 Sessió no activa. Accedint a login ({self.PORTAL_LOGIN_URL})...")
+                        page.goto(
+                            self.PORTAL_LOGIN_URL,
+                            wait_until="domcontentloaded",
+                            timeout=settings.SCRAPER_TIMEOUT_MS,
+                        )
+                        page.wait_for_timeout(2000)
+
+                        # Re-acceptar cookies al login si cal
+                        try:
+                            cookie_btn = page.query_selector(
+                                "#onetrust-accept-btn-handler, button:has-text('Acceptar'), button:has-text('Aceptar')"
                             )
-                            page.wait_for_timeout(2000)
-                            login_input = page.query_selector(
-                                "input#login, input[name*='login'], input[type='email'], input[name='username']"
-                            )
-                            pass_input = page.query_selector(
-                                "input#password, input[name*='password'], input[type='password']"
-                            )
+                            if cookie_btn and cookie_btn.is_visible():
+                                cookie_btn.click()
+                                page.wait_for_timeout(1000)
+                        except PlaywrightError:
+                            pass
+
+                        login_input = page.wait_for_selector(
+                            "input#login, input[name='_CustomLoginPortlet_login']",
+                            timeout=15000,
+                        )
+                        pass_input = page.wait_for_selector(
+                            "input#password, input[name='_CustomLoginPortlet_password']",
+                            timeout=15000,
+                        )
 
                         if not login_input or not pass_input:
                             msg = f"No s'ha trobat el formulari de login a {page.url}"
@@ -207,33 +229,70 @@ class VeoliaConnector(BaseConnector):
                             self.report_progress(f"❌ {msg}", status="error")
                             return downloaded
 
+                        self.report_progress(f"🔑 Introduint credencials de '{settings.VEOLIA_USER}'...")
                         login_input.fill(settings.VEOLIA_USER or "")
                         pass_input.fill(settings.VEOLIA_PASSWORD or "")
-                        submit_btn = page.query_selector(
-                            "button#btn-submit, button[type='submit'], input[type='submit']"
-                        )
-                        if submit_btn:
+
+                        # Activar el botó Acceder disabled
+                        page.dispatch_event("input#login", "input")
+                        page.dispatch_event("input#login", "change")
+                        page.dispatch_event("input#password", "input")
+                        page.dispatch_event("input#password", "change")
+                        page.wait_for_timeout(500)
+
+                        submit_btn = page.query_selector("button#btn-submit")
+                        if submit_btn and not submit_btn.is_disabled():
                             submit_btn.click()
                         else:
-                            pass_input.press("Enter")
+                            page.evaluate(
+                                "() => { const f = document.querySelector('#loginForm'); if (f) f.submit(); }"
+                            )
 
                         page.wait_for_load_state("domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS)
                         page.wait_for_timeout(3500)
 
-                        if "login" in page.url.lower() and page.query_selector("input[type='password']"):
-                            msg = "Login rebutjat a Veolia (revisa usuari/contrasenya o bloqueig captcha)."
+                        # Detecció de 2FA (6 dígits)
+                        two_fa_container = page.query_selector("#two-factor-code-inputs, #two-factor-code-1")
+                        if two_fa_container:
+                            self.report_progress("🔐 Veolia sol·licita codi 2FA de 6 dígits...", status="warning")
+                            code_to_use = otp_code
+                            if not code_to_use and imap_client and imap_client.is_configured():
+                                self.report_progress("📧 Cercant codi 2FA a la bústia de correu...")
+                                code_to_use = self._fetch_otp_code_from_email(imap_client, timeout_seconds=75)
+
+                            if code_to_use and len(code_to_use) >= 6:
+                                self.report_progress(f"🔐 Introduint codi 2FA: {code_to_use}...")
+                                for digit_idx, char in enumerate(code_to_use[:6], start=1):
+                                    digit_input = page.query_selector(f"#two-factor-code-{digit_idx}")
+                                    if digit_input:
+                                        digit_input.fill(char)
+                                verify_btn = page.query_selector("button#verify-code")
+                                if verify_btn:
+                                    verify_btn.click()
+                                page.wait_for_load_state("domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS)
+                                page.wait_for_timeout(3000)
+                            else:
+                                msg = "🔐 Veolia requereix codi 2FA enviat per correu. Introdueix-lo o torna a provar."
+                                self.record_failure(msg)
+                                self.report_progress(f"⚠️ {msg}", status="warning")
+                                return downloaded
+
+                        # Verificar si el login ha fallat
+                        if "login" in page.url.lower() and page.query_selector("input#password"):
+                            msg = "Login rebutjat a Veolia (revisa usuari/contrasenya o possible captcha)."
                             self.record_failure(msg)
                             self.report_progress(f"❌ {msg}", status="error")
                             return downloaded
 
-                    # 3. Desar sessió vàlida
+                    # 3. Desar sessió vàlida al NAS
                     try:
                         context.storage_state(path=str(session_file))
+                        self.logger.info("✅ Sessió de Veolia desada al NAS!")
                     except (OSError, RuntimeError):
                         pass
 
-                    # 4. Anar a l'apartat de factures si cal
-                    if "mis-facturas" not in page.url.lower() and "factur" not in page.url.lower():
+                    # 4. Navegar al llistat de factures si no hi som
+                    if "mis-facturas" not in page.url.lower():
                         self.report_progress("🌐 Accedint al llistat de factures de Veolia...")
                         page.goto(
                             self.PORTAL_INVOICES_URL,
@@ -242,17 +301,23 @@ class VeoliaConnector(BaseConnector):
                         )
                         page.wait_for_timeout(3000)
 
-                    # 5. Cercar enllaços de descàrrega de PDF (segons DOM real)
-                    download_buttons = page.query_selector_all(
-                        "#descargar-factura-digital a, a:has-text('Descarrega'), a:has-text('Descargar'), "
-                        "a[href*='descargarFacturaPdf'], a[onclick*='descargarFacturaPdf'], a[href*='.pdf'], button:has-text('PDF')"
+                    # 5. Cerca els enllaços de detall de les factures (segons DOM real d'Agbar/Veolia)
+                    detail_links = page.query_selector_all(
+                        "a[data-test-id='verDetalleFactura'], a[href*='/misfacturas/view/']"
                     )
-                    total_found = len(download_buttons)
+
+                    invoice_urls: list[str] = []
+                    for a in detail_links:
+                        href = a.get_attribute("href")
+                        if href and "/misfacturas/view/" in href and href not in invoice_urls:
+                            invoice_urls.append(href)
+
+                    total_found = len(invoice_urls)
                     max_dl = min(limit, total_found) if limit is not None else total_found
 
                     if total_found == 0:
                         self.report_progress(
-                            f"⚠️ Connectat a {page.url}, però s'han trobat 0 botons de factura descarregables.",
+                            f"⚠️ Connectat a {page.url}, però s'han trobat 0 enllaços de factura.",
                             status="warning",
                         )
                         return downloaded
@@ -263,22 +328,44 @@ class VeoliaConnector(BaseConnector):
                         total=max_dl,
                     )
 
-                    for i, btn in enumerate(download_buttons[:max_dl], start=1):
+                    for i, inv_url in enumerate(invoice_urls[:max_dl], start=1):
+                        inv_num_hint = inv_url.split("/")[-3] if len(inv_url.split("/")) >= 3 else f"factura_{i}"
                         self.report_progress(
-                            f"⬇️ Descarregant factura {i} de {max_dl} des del portal Veolia...",
+                            f"⬇️ Accedint a factura {i} de {max_dl} ({inv_num_hint})...",
                             current=i,
                             total=max_dl,
                         )
                         try:
+                            page.goto(inv_url, wait_until="domcontentloaded", timeout=20000)
+                            page.wait_for_timeout(1500)
+
+                            # A la pàgina de detall, el botó oficial de descàrrega és #descargar-factura-digital a
+                            dl_btn = page.query_selector(
+                                "#descargar-factura-digital a, a[onclick*='descargarFacturaPdf'], a:has-text('Descarrega factura digital')"
+                            )
+                            if not dl_btn:
+                                self.report_progress(
+                                    f"⚠️ No s'ha trobat botó de descàrrega a la factura {i}/{max_dl}",
+                                    current=i,
+                                    total=max_dl,
+                                    status="warning",
+                                )
+                                continue
+
                             with page.expect_download(timeout=20000) as download_info:
-                                btn.click()
+                                dl_btn.click()
                             download = download_info.value
                             path = download.path()
                             if path:
                                 with open(path, "rb") as f:
                                     downloaded.append(
-                                        (f.read(), download.suggested_filename or f"veolia_factura_{i}.pdf")
+                                        (f.read(), download.suggested_filename or f"veolia_{inv_num_hint}.pdf")
                                     )
+                                self.report_progress(
+                                    f"✅ Factura {i}/{max_dl} descarregada correctament!",
+                                    current=i,
+                                    total=max_dl,
+                                )
                         except PlaywrightTimeoutError:
                             self.report_progress(
                                 f"⏱️ Timeout (20s) esperant la descàrrega de la factura {i}/{max_dl}. Saltant a la següent...",
@@ -307,6 +394,38 @@ class VeoliaConnector(BaseConnector):
             self.record_success()
 
         return downloaded
+
+    def _fetch_otp_code_from_email(
+        self,
+        imap_client: ImapMailboxClient,
+        timeout_seconds: int = 75,
+    ) -> str | None:
+        """Cerca el codi 2FA de 6 dígits enviat per Veolia a la bústia IMAP."""
+        import time
+
+        start_time = time.time()
+        self.logger.info(f"Esperant arribada del correu 2FA de Veolia (fins a {timeout_seconds}s)...")
+        while time.time() - start_time < timeout_seconds:
+            emails = imap_client.fetch_recent_emails(
+                sender_filters=list(self.EMAIL_SENDERS),
+                days_back=1,
+            )
+            for em in emails:
+                subject_clean = em.subject.lower()
+                body_clean = em.body_text
+                if (
+                    "código" in subject_clean
+                    or "codi" in subject_clean
+                    or "autentic" in subject_clean
+                    or "identitat" in subject_clean
+                ):
+                    match = re.search(r"\b(\d{6})\b", body_clean)
+                    if match:
+                        code = match.group(1)
+                        self.logger.info(f"✅ Codi 2FA de Veolia capturat del correu: {code}")
+                        return code
+            time.sleep(3)
+        return None
 
     def fetch_available_invoices(self, imap_client: ImapMailboxClient) -> list[dict]:
         """Llista les factures de Veolia trobades a la bústia i el seu estat al NAS."""
