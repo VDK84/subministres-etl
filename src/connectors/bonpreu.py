@@ -235,6 +235,14 @@ class BonpreuConnector(BaseConnector):
                             # Si tenim el codi (automàtic o proporcionat per l'usuari)
                             if code_to_use:
                                 self.report_progress(f"🔐 Aplicant codi 2FA a Bonpreu: {code_to_use}...")
+                                # Eliminar overlay de cookies si existeix
+                                try:
+                                    page.evaluate(
+                                        "() => { const el = document.querySelector('#onetrust-consent-sdk'); if (el) el.remove(); }"
+                                    )
+                                except (PlaywrightError, OSError):
+                                    pass
+
                                 page.fill("input#code", code_to_use)
                                 page.dispatch_event("input#code", "input")
                                 page.dispatch_event("input#code", "change")
@@ -242,13 +250,9 @@ class BonpreuConnector(BaseConnector):
                                 with page.expect_navigation(
                                     wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS
                                 ):
-                                    verify_btn = page.query_selector("button.verify-button, button[type='submit']")
-                                    if verify_btn and not verify_btn.is_disabled():
-                                        verify_btn.click()
-                                    else:
-                                        page.evaluate(
-                                            "() => { const f = document.querySelector('#kc-email-totp-code-login-form'); if (f) f.submit(); }"
-                                        )
+                                    page.evaluate(
+                                        "() => { const b = document.querySelector('.verify-button'); if (b) { b.disabled = false; b.click(); } else { const f = document.querySelector('#kc-email-totp-code-login-form'); if (f) f.submit(); } }"
+                                    )
                                 page.wait_for_timeout(5000)
                             else:
                                 msg = "🔐 Bonpreu requereix codi 2FA enviat per correu. Introdueix-lo o torna a provar."
@@ -350,6 +354,8 @@ class BonpreuConnector(BaseConnector):
                 sender_filters=["bonpreu", "info@bonpreu.cat"],
                 days_back=1,
             )
+            # Ordenar els correus del més recent al més antic per agafar sempre l'últim codi generat
+            emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
             for em in emails:
                 subject_clean = em.subject.lower()
                 body_clean = em.body_text
