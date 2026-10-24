@@ -236,24 +236,41 @@ class BonpreuConnector(BaseConnector):
                             if code_to_use:
                                 self.report_progress(f"🔐 Aplicant codi 2FA a Bonpreu: {code_to_use}...")
                                 page.fill("input#code", code_to_use)
+                                page.dispatch_event("input#code", "input")
+                                page.dispatch_event("input#code", "change")
+                                page.wait_for_timeout(500)
                                 with page.expect_navigation(
                                     wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS
                                 ):
-                                    page.evaluate(
-                                        "() => { const f = document.querySelector('#kc-email-totp-code-login-form'); if (f) f.submit(); }"
-                                    )
-                                page.wait_for_timeout(3500)
+                                    verify_btn = page.query_selector("button.verify-button, button[type='submit']")
+                                    if verify_btn and not verify_btn.is_disabled():
+                                        verify_btn.click()
+                                    else:
+                                        page.evaluate(
+                                            "() => { const f = document.querySelector('#kc-email-totp-code-login-form'); if (f) f.submit(); }"
+                                        )
+                                page.wait_for_timeout(5000)
                             else:
                                 msg = "🔐 Bonpreu requereix codi 2FA enviat per correu. Introdueix-lo o torna a provar."
                                 self.record_failure(msg)
                                 self.report_progress(f"⚠️ {msg}", status="warning")
                                 return downloaded
 
-                    # 4. Si hem accedit amb èxit, desem la sessió al NAS
-                    if "keycloak" not in page.url.lower():
+                    # 4. Esperar que finalitzi l'intercanvi de token i la redirecció a energia.bonpreuesclat.cat
+                    for _ in range(15):
+                        if (
+                            "energia.bonpreuesclat.cat" in page.url
+                            and "connect" not in page.url
+                            and "keycloak" not in page.url
+                        ):
+                            break
+                        page.wait_for_timeout(1000)
+
+                    # Si hem accedit amb èxit, desem la sessió al NAS
+                    if "energia.bonpreuesclat.cat" in page.url and "keycloak" not in page.url:
                         try:
                             context.storage_state(path=str(session_file))
-                            self.logger.info("✅ Sessió de Bonpreu desada al NAS per a futures execucions!")
+                            self.report_progress("✅ Sessió de Bonpreu desada al NAS!")
                         except (OSError, RuntimeError):
                             pass
 
@@ -261,11 +278,12 @@ class BonpreuConnector(BaseConnector):
                     if "factur" not in page.url.lower():
                         self.report_progress("🌐 Accedint a l'apartat de factures de Bonpreu...")
                         page.goto(portal_url, wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS)
-                        page.wait_for_timeout(3000)
+                        page.wait_for_timeout(4000)
 
                     # 6. Cerca botons de descàrrega de PDF
+                    page.wait_for_timeout(3000)
                     download_buttons = page.query_selector_all(
-                        "button:has-text('Descarregar pdf'), button:has-text('Descarregar'), a[href*='.pdf'], a:has-text('PDF'), button:has-text('PDF')"
+                        "a[href*='/descarregar'], a[href*='/descargar'], button:has-text('Descarregar'), button:has-text('Descargar'), a[href*='.pdf']"
                     )
                     total_found = len(download_buttons)
                     max_dl = min(limit, total_found) if limit is not None else total_found
