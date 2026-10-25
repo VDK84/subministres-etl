@@ -302,42 +302,61 @@ class DigiConnector(BaseConnector):
         if not num_factura:
             num_factura = extract_regex_first(text, r"Factura\s+([A-Za-z0-9/_-]{6,20})")
 
-        # 2. Data d'emissió
+        # 2. Període facturat (ex: "16 de septiembre de 2026 a 15 de octubre de 2026" o "01/09/2026 - 30/09/2026")
+        dt_inici, dt_fi = extract_date_range(
+            text,
+            r"(?:Per[íi]odo\s*(?:de\s*)?facturaci[óo]n|Per[íi]ode\s*facturat|Per[íi]ode):?\s*"
+            r"(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})"
+            r"\s*(?:al|fins\s*a|a|-)\s*"
+            r"(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})",
+        )
+
+        # 3. Data d'emissió (suportant tant dd/mm/yyyy com "16 de octubre de 2026")
         data_str = extract_regex_first(
-            text, r"(?:Fecha\s*de\s*emisi[óo]n|Data\s*d'emissi[óo]):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+            text,
+            r"(?:Fecha\s*(?:de\s*)?emisi[óo]n|Data\s*(?:d')?emissi[óo]|Fecha\s*factura):?\s*\n?\s*"
+            r"(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})",
         )
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
-        if not data_emissio and num_factura:
-            # Deducim l'any i el mes del patró oficial DGFC + AA + MM
-            dgfc_match = re.search(r"DGFC(\d{2})(\d{2})", num_factura)
-            if dgfc_match:
-                try:
-                    any_d = 2000 + int(dgfc_match.group(1))
-                    mes_d = int(dgfc_match.group(2))
-                    data_emissio = date(any_d, mes_d, 1)
-                except ValueError:
-                    pass
 
-        # 3. Import total (prioritzant el total oficial de factura amb 2 decimals)
-        total_eur = extract_float_value(
-            text,
-            r"(?:Total\s*a\s*pagar|TOTAL\s*FACTURA|Import\s*total|Importe\s*total)[^0-9\n]{0,30}?[:\s]\s*(\d{1,4}[.,]\d{2})\s*€?",
-        )
+        # Si no ha trobat l'etiqueta explícita, usem la data de fi del període facturat
+        if not data_emissio and dt_fi:
+            data_emissio = dt_fi
+
+        # Si encara no tenim data, busquem qualsevol data explícita al primer terç del document
+        if not data_emissio:
+            any_date_str = extract_regex_first(
+                text[:1500],
+                r"\b(\d{1,2}\s+de\s+[a-zA-ZÀ-ÿ]+\s+de\s+20\d{2}|\d{1,2}[/-]\d{1,2}[/-]20\d{2})\b",
+            )
+            if any_date_str:
+                data_emissio = parse_date_catalan_spanish(any_date_str)
+
+        # 4. Import total (cercant específicament els patrons d'import amb coma decimal de Digi)
+        total_eur: float | None = None
+        digi_total_patterns = [
+            r"(?:TOTAL\s+A\s+PAGAR|TOTAL\s+FACTURA|Importe\s+total|Total\s+factura)[^0-9€]{0,60}?(\d{1,3}[.,]\d{2})\s*€",
+            r"(\d{1,3}[.,]\d{2})\s*€\s*(?:TOTAL\s+FACTURA|TOTAL\s+A\s+PAGAR)",
+            r"TOTAL\s+SERVICIOS[^0-9€]{0,40}?(\d{1,3}[.,]\d{2})\s*€",
+        ]
+        for pat in digi_total_patterns:
+            val = extract_float_value(text, pat)
+            if val is not None and 0.5 <= val <= 400.0:
+                total_eur = val
+                break
+
         if total_eur is None:
-            total_eur = extract_float_value(text, r"(\d{1,4}[.,]\d{2})\s*€?\s*TOTAL\s*FACTURA")
-        if total_eur is None:
-            total_eur = extract_float_value(text, r"TOTAL\s*SERVICIOS[^0-9]{0,20}?(\d{1,4}[.,]\d{2})\s*€?")
-        if total_eur is None:
-            total_eur = parse_euro_amount(text)
+            all_euro_matches = re.findall(r"\b(\d{1,3},\d{2})\s*€", text)
+            valid_amounts = []
+            for m_str in all_euro_matches:
+                v = extract_float_value(m_str, r"(\d{1,3},\d{2})")
+                if v is not None and 1.0 <= v <= 400.0:
+                    valid_amounts.append(v)
+            if valid_amounts:
+                total_eur = max(valid_amounts)
 
         if total_eur is None:
             return None
-
-        # 4. Període facturat
-        dt_inici, dt_fi = extract_date_range(
-            text,
-            r"(?:Per[íi]odo\s*de\s*facturaci[óo]n|Per[íi]ode):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:al|a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-        )
 
         # 5. Dades addicionals de telefonia
         total_gb = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*GB")
@@ -350,7 +369,7 @@ class DigiConnector(BaseConnector):
             periode_inici=dt_inici,
             periode_fi=dt_fi,
             dies_facturats=(dt_fi - dt_inici).days if (dt_inici and dt_fi) else None,
-            import_total=float(total_eur),
+            import_total=total_eur,
             total_gb_consumits=total_gb,
         )
 

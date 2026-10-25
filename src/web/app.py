@@ -341,9 +341,110 @@ def list_nas_invoices() -> list[dict[str, Any]]:
         except OSError:
             continue
 
-    # Ordenar per data de modificació descendent
-    invoices.sort(key=lambda x: x["modified"], reverse=True)
+    # Ordenar per data real de la factura descendent (i per data de modificació/nom en cas d'empat)
+    invoices.sort(key=lambda x: (x["date_iso"], x["modified"], x["filename"]), reverse=True)
     return invoices
+
+
+def reparse_and_fix_nas_invoices() -> tuple[int, int]:
+    """Re-analitza tots els PDFs del NAS, reanomena/mou els que tenien data errònia (ex: 2022) i actualitza InfluxDB."""
+    root = Path(settings.NAS_MOUNT_PATH)
+    if not root.exists():
+        return 0, 0
+
+    _pdf_amount_cache.clear()
+    processed = 0
+    renamed = 0
+
+    all_pdfs = list(root.glob("**/*.pdf"))
+    total = len(all_pdfs)
+
+    for idx, pdf_path in enumerate(all_pdfs, start=1):
+        try:
+            rel_path = pdf_path.relative_to(root)
+            parts = rel_path.parts
+            proveidor = parts[1].lower() if len(parts) > 1 else ""
+            conn = CONNECTORS_MAP.get(proveidor)
+            if not conn:
+                continue
+
+            if main_loop and main_loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    ws_manager.broadcast_progress(
+                        {
+                            "connector": proveidor.upper(),
+                            "step": f"🔄 Re-analitzant PDF {pdf_path.name}...",
+                            "current": idx,
+                            "total": total,
+                            "percent": int((idx / total) * 100),
+                            "status": "running",
+                        }
+                    ),
+                    main_loop,
+                )
+
+            pdf_bytes = pdf_path.read_bytes()
+            metriques = conn.extract_metrics_from_pdf(pdf_bytes)
+            if not metriques:
+                continue
+
+            # Verificar si el fitxer tenia un any o mes erroni al nom (ex: 2022_10_digi_... quan és del 2026)
+            any_correcte = str(metriques.data_emissio.year)
+            mes_correcte = f"{metriques.data_emissio.month:02d}"
+            clean_num = re.sub(r"[^A-Za-z0-9_-]", "", metriques.numero_factura)
+            expected_filename = f"{any_correcte}_{mes_correcte}_{conn.name}_{clean_num}.pdf"
+            expected_dir = storage.get_destination_dir(conn.tipus.value, conn.name, any_correcte)
+            expected_path = expected_dir / expected_filename
+
+            if pdf_path.resolve() != expected_path.resolve():
+                expected_path.write_bytes(pdf_bytes)
+                pdf_path.unlink(missing_ok=True)
+                renamed += 1
+                logger.info(f"🔧 Corregida ubicació/data: {pdf_path.name} -> {expected_path.name}")
+
+            # Netejar mètrica antiga a InfluxDB i escriure la nova corregida
+            influx_writer.delete_factura_metrics(proveidor, metriques.numero_factura)
+            influx_writer.write_factura_metrics(metriques)
+            processed += 1
+        except (OSError, RuntimeError, ValueError) as err:
+            logger.warning(f"Error re-analitzant {pdf_path.name}: {err}")
+
+    return processed, renamed
+
+
+@app.post("/api/reparse")
+async def trigger_reparse(background_tasks: BackgroundTasks):
+    """Re-analitza tots els PDFs del NAS per corregir dates (ex: 2022) i imports a InfluxDB."""
+    if execution_state["is_running"]:
+        return HTMLResponse(
+            '<div class="p-4 mb-4 text-sm text-yellow-300 rounded-xl bg-yellow-950/60 border border-yellow-700/50">'
+            "⚠️ Ja hi ha una tasca en curs. Espera que finalitzi.</div>"
+        )
+
+    def _task():
+        execution_state["is_running"] = True
+        execution_state["active_connector"] = "REPARACIÓ NAS & INFLUXDB"
+        try:
+            proc, ren = reparse_and_fix_nas_invoices()
+            msg = (
+                f"✅ Reparació completada: {proc} factures re-analitzades i actualitzades a InfluxDB "
+                f"({ren} fitxers moguts a la seva data correcta)."
+            )
+            logger.info(msg)
+            if main_loop and main_loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    ws_manager.broadcast_status({"status": "ok", "message": msg, "new_count": proc}),
+                    main_loop,
+                )
+        finally:
+            execution_state["is_running"] = False
+            execution_state["active_connector"] = None
+
+    background_tasks.add_task(_task)
+    return HTMLResponse(
+        '<div class="p-4 mb-4 text-sm text-blue-300 rounded-xl bg-blue-950/60 border border-blue-700/50">'
+        "🔄 Re-analitzant tots els PDFs del NAS per corregir imports i dates errònies... La pàgina es recarregarà en acabar.</div>"
+    )
 
 
 def run_sync_task(

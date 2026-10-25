@@ -1,744 +1,410 @@
-El codi del repositori (`concat_6.txt`) ha fet un salt de qualitat brutal: ja tens els 4 scrapers amb Playwright operatius (incloent el 2FA automàtic per correu a Bonpreu i Veolia, i la selecció de pestanya GAS a l'Oficina Virtual de Catgas), la barra de progrés `X/N` per WebSocket i els botons separats de Correu i Portal Web.
-
-Tot i això, revisant al mil·límetre la connexió entre el **codi Python**, **InfluxDB** i el **Dashboard de Grafana (CaC)**, hi ha **errors crítics a les consultes Flux del Dashboard** que faran que els gràfics de barres i la taula fallin o mostrin dades buides, a més d'un parell de detalls als connectors que et permetran treure molt més suc a Grafana.
+He trobat exactament els **4 errors al codi (`concat_7.txt`)** que fan que el filtre de dates, el botó `"⭐ Últimes factures"` i les factures de Digi mostrin l'any **2022** i l'**import incorrecte**.
 
 ---
 
-### Part 1: Errors Crítics al Dashboard de Grafana (i com corregir-los)
+### Diagnòstic exacte dels problemes
 
-1. **Els panells de BarChart (Panells 6, 8 i 9) es trencaran o ajuntaran totes les factures:**
-* A les queries dels Panells 6, 8 i 9 fas un `|> keep(columns: ["_time", "_value", "proveidor"])` **abans** de fer `|> aggregateWindow(every: 1mo, fn: sum, createEmpty: false)`.
-* **El problema a Flux (InfluxDB v2):** Per defecte, cada factura té els tags `numero_factura`, `any`, `mes`, `referencia`, etc.. En Flux, cada combinació de tags és una taula separada. Quan fas `keep(columns: ["_time", "_value", "proveidor"])`, elimines les columnes `numero_factura`, `any` i `mes` de les taules, però **les taules segueixen dividides internament per l'agrupació antiga**! Si no fas un `|> group(columns: ["proveidor"])` (als panells 6 i 9) o `|> group(columns: ["_field"])` (al panell 8) abans d'`aggregateWindow`, Grafana rebrà desenes de sèries soltes amb el mateix nom (`bonpreu`, `bonpreu`...) en lloc d'una sola sèrie mensual per proveïdor.
+#### 1. Per què Digi t'ensenya una factura del **2022** com si fos l'última? (2 bugs combinats)
 
-
-* A més, canviant aquests panells a **`timeseries`** amb `"drawStyle": "bars"` i `timeSrc: "_start"`, Grafana pinta l'eix temporal mensual (`1mo`) de forma nativa, apila les barres perfecte i permet superposar l'any anterior!
+* **Bug A — La regex `DGFC(\d{2})(\d{2})` interpreta el codi d'empresa `22` com l'any `2022`:**
+A `src/connectors/digi.py` (línia 280), quan el parser no troba la data d'emissió, fa:
 
 
-2. **El filtre desplegable `$proveidor` no funciona quan selecciones `"All"`:** * Al JSON tens la variable `proveidor` amb `"includeAll": true` i `"current": { "text": "All", "value": "$__all" }`.
-* Quan selecciones `"All"`, Grafana **no substitueix `"$proveidor"` pel text `"All"**`, sinó que hi injecta una llista o expressió regular. Per tant, la condició `r.proveidor == "$proveidor"` falla quan selecciones `All`!
-* **Solució:** Posar `"allValue": "All"` a la definició de la variable `proveidor` dins de `templating.list`.
+```python
+dgfc_match = re.search(r"DGFC(\d{2})(\d{2})", num_factura)
+
+```
 
 
-3. **El Panell 10 (Taula `"📑 Registre de Factures Processades"`) pot donar error si alguna columna encara no existeix:**
-* En Flux, si en el rang de temps seleccionat cap factura té el tag `"titular"` (que ara mateix cap dels teus 4 connectors extreu), `keep()` pot fallar si la columna no existeix a l'esquema d'aquell *chunk*. Fent `|> pivot(...) |> group()` sense un `keep()` rígid sobre columnes inexistents, la taula mostrarà totes les columnes reals disponibles (incloent `consum_kwh_punta`, `consum_kwh_pla`, `consum_kwh_vall`, `potencia_contractada_kw` i `total_gb_consumits`).
+**Error greu:** Moltes factures de Digi comencen per `DGFC2210546467` on `22` és la sèrie de facturació (no l'any!) i `10` tampoc és el mes! I el que és encara pitjor: en algunes factures del 2026 com `DGFC2623970096`, els dígits 3 i 4 són `23` (`int("23")` > 12 mesos, que llança `ValueError` i cau a `date.today()`), però en una factura antiga o amb prefix `DGFC22...`, els dígits són `22` i `10`, i el teu codi li assigna **`date(2022, 10, 1)`**!
 
 
+* A més, per què no troba la data real al PDF de Digi? Perquè a les factures de Digi la data d'emissió ve escrita amb el mes en lletres (ex: `Fecha de emisión: 15 de octubre de 2026` o `02/10/2026` en una altra línia), però la regex de `digi.py` (línia 275) només accepta números amb barres `(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})` a la mateixa línia!
+
+
+
+
+* **Bug B — La taula i el botó `"⭐ Últimes factures"` ordenen per `Data Fitxer` (`stat.st_mtime`), NO per la data de la factura (`date_iso`):**
+A `src/web/app.py` (línia 300), fas:
+
+
+```python
+invoices.sort(key=lambda x: x["modified"], reverse=True)
+
+```
+
+
+Quan fas un scraping massiu o puges un ZIP, l'última factura que es descarrega al disc (que als portals web és sempre **la més antiga**, del 2022 o 2024, perquè és l'última de la llista!) té el `modified` (`st_mtime`) més recent (per uns segons de diferència)!
+Com que `filterInvoices()` a `index.html` simplement agafa la **primera fila que apareix al DOM** per a cada proveïdor (`seenProviders.has(rProv)`), i la primera fila és l'últim fitxer escrit al disc, **et mostra la factura del 2022 com a "Última factura"** tant a la taula com a les targetes superiors (`last_by_provider`)!
+
+
+
+#### 2. Per què l'import de Digi segueix sent incorrecte (ex: `992.00 €` o un valor erroni)?
+
+Hi ha dos motius:
+
+1. **Dades velles a InfluxDB que mai s'han sobreescrit:** `list_nas_invoices()` a `app.py` (línia 263) mira primer `amounts_map.get(num_clean)` que ve d'InfluxDB. Si quan es va descarregar aquella factura de Digi es va desar a InfluxDB amb l'import dolent (`992.00 €`), com que quan fas clic a "Sincronitzar" el fitxer ja existeix al NAS, ni tan sols es re-escriu o a InfluxDB hi queden punts amb timestamps diferents! Encara no s'ha afegit l'endpoint `/api/reparse` per netejar i recalcular InfluxDB des dels PDFs del NAS.
+
+
+2. **Estructura del PDF de Digi quan `pypdf` extreu el text:** En el PDF de Digi, el bloc de resum sovint s'extreu amb les etiquetes a dalt i els números diverses línies més avall, o amb el format `Total a pagar 25,00€` / `TOTAL FACTURA 25,00 €`, mentre que al peu de pàgina de Digi hi ha el text legal `Inscrita en el Registro Mercantil...` o tarifes de trucades. Cal ajustar `digi.py` perquè busqui específicament l'import del resum de factura i afegir el botó de **Recalcular Imports** perquè actualitzi tots els PDFs ja baixats.
+
+
+
+#### 3. Dos errors més al Filtre de Dates i a l'Etiquetatge Trimestral
+
+1. **El filtre `Fins:` (`date-to`) i `date_iso` sempre posa dia `-01` (`YYYY-MM-01`):**
+A `src/web/app.py` (línia 255), totes les factures reben `date_iso = f"{clean_year}-{date_month}-01"`. Si un usuari filtra `De: 2026-10-05` `Fins: 2026-10-25`, la factura d'octubre té `data-date="2026-10-01"`, que és `< 2026-10-05`, i **desapareix del filtre tot i ser d'octubre**!
+
+
+2. **Etiquetatge trimestral de Veolia erroni per al mes `10` (Octubre):**
+A `src/web/app.py` (línia 234), has posat:
+
+
+```python
+elif mes_code in ("07", "08", "09", "10", "T3"):
+    mes_label = "3r Trim (T3)"
+
+```
+
+
+Però si una factura és del mes `10`, més avall (línia 245) fas `if mes_code.isdigit(): date_month = mes_code.zfill(2)` (`10`), mentre que si era `T3` li poses `09`. I el 4t trimestre (`T4`) queda només per a `11` i `12`. Si el PDF de Veolia ja té el tag `trimestre` o el nom de fitxer té el mes real, cal ser coherent i ordenar sempre per `(any, mes_num, modified)`!
 
 
 
 ---
 
-### Part 2: 3 Millores al Codi Python (`concat_6.txt`) per a velocitat i dades
+### Instruccions per a l'Agent (`REFACTORING_PHASE7.md`)
 
-1. **A `digi.py` i `veolia.py`, `fetch_available_invoices()` no llista els PDFs que ja són al NAS si s'han baixat pel Portal Web:**
-* A `bonpreu.py` i `catgas.py` l'agent ha afegit el bloc final `# Afegir també les factures que ja tenim al volum NAS`, però **s'ha deixat de posar aquest mateix bloc al final de `fetch_available_invoices` a `digi.py` i a `veolia.py**`.
-
-
-
-
-2. **A `veolia.py` i `digi.py`, el scraper web no omet d'entrada les factures que ja són al NAS:**
-* A `bonpreu.py` i `catgas.py`, abans de clicar el botó de descàrrega es comprova `if ja_al_nas: continue`. En canvi, a `veolia.py` entra a cada URL de factura i baixa el PDF encara que `inv_num_hint` ja existeixi al NAS. Comprovar-ho abans de fer `page.goto(inv_url)` t'estalviarà 20 segons per factura!
-
-
-
-
-3. **Càlcul automàtic de mètriques derivades (`cost_diari_eur` i `preu_unitari`) a `influx_writer.py`:**
-* Abans d'enviar el `Point` a InfluxDB, si `dies_facturats > 0`, podem guardar directament el camp `cost_diari_eur = import_total / dies_facturats`, `preu_kwh = import_total / consum_kwh` i `preu_m3 = import_total / consum_m3`. Això fa que les consultes de Grafana siguin instantànies!
-
-
-
-
-
----
-
-### Part 3: Potenciació del Dashboard amb Variació Interanual (YoY) i Costos Unitaris
-
-Sense eliminar cap dels teus panells actuals, afegim al Dashboard:
-
-1. **📉 Gràfic Comparatiu Interanual (YoY — Mes actual vs. Mateix mes de l'any passat):** Un panell on les barres verdes mostren la despesa de cada mes d'enguany i una **línia discontínua blava/taronja (amb `timeShift(duration: 1y)` a Flux)** hi superposa exactament què vas pagar el mateix mes de l'any passat!
-2. **📊 KPI de Variació Interanual Acumulada (€ i % YoY):** Targeta comparant la despesa dels últims 12 mesos respecte als 12 mesos anteriors.
-3. **🏦 KPI de Despesa Acumulada en el Període Seleccionat (€)**.
-4. **📈 Evolució del Cost Real de l'Energia (€/kWh tot inclòs de Llum i Gas, i €/m³ d'Aigua)**.
-
----
-
-### Document complet d'instruccions per a l'Agent (`REFACTORING_PHASE6.md`)
-
-Copia aquest bloc Markdown i passa-li directament al teu agent perquè apliqui les millores tant al codi Python com al manifest del Dashboard de Grafana:
+Passa-li aquest document al teu agent. Soluciona d'una tacada l'ordenació real d'"Últimes factures", la data 2022 i l'import de Digi, el filtre de rang de dates i afegeix el botó de **Recalcular / Reparar Factures NAS** perquè reanomeni qualsevol PDF de Digi que es guardés a la carpeta `2022` per error i en corregeixi l'import a InfluxDB!
 
 ```markdown
-# Pla de Millora (Fase 6) — Dashboard Grafana amb Variació Interanual (YoY), Costos Unitaris i Optimització NAS a Veolia/Digi
+# Pla de Correcció (Fase 7) — Fix "Últimes Factures", Fix Data 2022 i Import de Digi, Filtre de Dates i Reparació NAS
 
-Aquest document conté dues parts:
-1. **Optimitzacions al codi Python (`veolia.py`, `digi.py` i `influx_writer.py`)**: Omissió ràpida de factures ja existents al NAS abans de descarregar-les amb Playwright, llistat complet al modal d'Històric i càlcul automàtic de mètriques derivades (`cost_diari_eur`, `preu_kwh`, `preu_m3`).
-2. **ConfigMap del Dashboard de Grafana CaC (`06-subministres-factures.yaml`) corregit i potenciat**: Soluciona el bug del filtre `$proveidor = All`, corregeix l'agrupació de les sèries mensuals amb `group()` i afegeix la **Comparativa Interanual (YoY amb `timeShift(duration: 1y)`)** i el **Cost Real Unitari (€/kWh i €/m³)**.
-
----
-
-## 1. Millores al Codi Python (`veolia.py`, `digi.py` i `influx_writer.py`)
-
-### 1.1. Ometre factures ja descarregades al NAS a `src/connectors/veolia.py` i `src/connectors/digi.py`
-1. A **`src/connectors/veolia.py`**, dins `fetch_invoices_from_portal`, just abans del bucle `for i, inv_url in enumerate(invoice_urls[:max_dl], start=1):`, comprovar si el número de factura (`inv_num_hint`) ja existeix al NAS per no tornar-lo a descarregar:
-```python
-                    nas_root = Path(settings.NAS_MOUNT_PATH) / self.tipus.value / self.name
-                    existing_files = list(nas_root.glob("**/*.pdf")) if nas_root.exists() else []
-
-                    for i, inv_url in enumerate(invoice_urls[:max_dl], start=1):
-                        inv_num_hint = inv_url.split("/")[-3] if len(inv_url.split("/")) >= 3 else f"factura_{i}"
-                        if any(inv_num_hint in f.name for f in existing_files):
-                            self.report_progress(
-                                f"⏭️ Factura Veolia {inv_num_hint} ja és al NAS. Ometent ({i}/{max_dl}).",
-                                current=i,
-                                total=max_dl,
-                            )
-                            continue
-```
-
-2. Tant a **`src/connectors/veolia.py`** com a **`src/connectors/digi.py`**, al final de `fetch_available_invoices(self, imap_client: ImapMailboxClient)`, afegir el mateix bloc d'exploració del volum NAS que ja tenen `bonpreu.py` i `catgas.py` perquè el modal d'Històric mostri també les factures descarregades via Portal Web:
-```python
-        # Afegir també les factures que ja tenim al volum NAS (descarregades del portal web)
-        nas_root = Path(settings.NAS_MOUNT_PATH) / self.tipus.value / self.name
-        existing_nums = {str(inv.get("numero", "")).lower() for inv in invoices}
-
-        if nas_root.exists():
-            for pdf_path in sorted(nas_root.glob("**/*.pdf"), reverse=True):
-                stem = pdf_path.stem
-                parts = stem.split(f"_{self.name}_")
-                num = parts[-1] if len(parts) > 1 else stem
-                if num.lower() not in existing_nums:
-                    existing_nums.add(num.lower())
-                    any_folder = pdf_path.parent.name
-                    invoices.append(
-                        {
-                            "id": f"nas_{stem}",
-                            "proveidor": self.name,
-                            "tipus": self.tipus.value,
-                            "data": f"{any_folder}-01-01",
-                            "numero": num,
-                            "import": 0.0,
-                            "subject": f"Factura {num} al NAS",
-                            "exists_in_nas": True,
-                        }
-                    )
-        return invoices
-```
-
-### 1.2. Enriquir `write_factura_metrics` a `src/influx_writer.py` amb ràtios d'eficiència
-Dins de `write_factura_metrics` a `src/influx_writer.py`, just abans del bloc `try: with InfluxDBClient...`, afegir el càlcul automàtic de cost diari i preu unitari:
-```python
-        # Càlcul automàtic de ràtios unitaris per a Grafana
-        if metriques.dies_facturats and metriques.dies_facturats > 0:
-            point.field("cost_diari_eur", round(float(metriques.import_total) / int(metriques.dies_facturats), 4))
-        if metriques.consum_kwh and metriques.consum_kwh > 0:
-            point.field("preu_kwh_real", round(float(metriques.import_total) / float(metriques.consum_kwh), 4))
-        if metriques.consum_m3 and metriques.consum_m3 > 0:
-            point.field("preu_m3_real", round(float(metriques.import_total) / float(metriques.consum_m3), 4))
-```
+Aquest document resol 4 problemes crítics:
+1. **El botó "⭐ Últimes factures" i les targetes mostraven factures del 2022**: `list_nas_invoices()` ordenava per `stat.st_mtime` (`modified`, l'instant en què el fitxer es va escriure al disc) en comptes d'ordenar cronològicament per la data real de la factura (`date_iso`). Com que els scrapers baixen primer les recents i al final les antigues, l'últim fitxer escrit al NAS era el més vell (2022)!
+2. **Digi assignava l'any 2022 i imports erronis**: La regex `DGFC(\d{2})(\d{2})` interpretava el prefix de sèrie `DGFC22...` com l'any 2022 quan no trobava la data en format `dd/mm/yyyy` (perquè Digi sovint escriu la data amb text com `15 de octubre de 2026`).
+3. **El filtre de rang de dates i el botó "Últimes factures" al Frontend es desincronitzaven en ordenar columnes**: Ara `toggleLatestInvoices` calcula sempre la factura amb `data-date` més recent de cada proveïdor independentment de l'ordre actual de la taula.
+4. **Reparació automàtica de factures ja descarregades (`/api/reparse`)**: S'afegeix un endpoint i botó **"🔄 Reparar Imports i Dates"** que re-analitza tots els PDFs del NAS, mou de carpeta els que tinguin l'any/mes mal posat al nom (com els de Digi del 2022) i sobreescriu els imports corregits a InfluxDB.
 
 ---
 
-## 2. ConfigMap del Dashboard de Grafana Corregit i Potenciat (amb Variació Interanual YoY)
+## 1. Corregir l'extracció de Data i Import de Digi a `src/connectors/digi.py`
 
-### Millores clau del nou JSON de Grafana:
-- **Fix del filtre `$proveidor = All`**: S'afegeix `"allValue": "All"` a la variable de template perquè el filtre funcioni tant en seleccionar `"All"` com un proveïdor concret.
-- **Fix d'agrupació Flux (`|> group(...)`)**: Totes les consultes amb `aggregateWindow(every: 1mo, ...)` agrupen prèviament per `proveidor` o `_field` i usen `timeSrc: "_start"` per alinear cada barra al seu mes natural.
-- **Nou Panell ID 13 — 🔄 Comparativa Interanual (YoY: Enguany vs. Any Passat)**: Superposa amb barres verdes la despesa mensual actual (refId `A`) i amb una línia taronja discontínua la despesa del mateix mes de fa 1 any (`|> timeShift(duration: 1y)`, refId `B`).
-- **Nou Panell ID 14 — 📊 Variació Interanual (Últims 12m vs. 12m anteriors)**: Calcula la diferència percentual (%) entre la despesa acumulada dels darrers 12 mesos i la dels 12 mesos previs.
-- **Nou Panell ID 12 — 📈 Cost Real Unitari de l'Energia (€/kWh Llum i Gas)**.
+### Problema
+1. La regex de data d'emissió a `digi.py` només acceptava format numèric `dd/mm/yyyy`, ignorant dates amb text (`15 de octubre de 2026` o `15 oct. 2026`).
+2. Quan fallava, el fallback `re.search(r"DGFC(\d{2})(\d{2})", num_factura)` agafava el codi `22` de `DGFC22...` i creava una data falsa de l'any `2022`.
+3. Per a l'import total, les factures de Digi tenen una taula de resum on posa `Total factura` o `Total a pagar` i l'import pot estar separat per salts de línia o espais.
 
-### Fitxer YAML complet del ConfigMap:
+### Canvi a aplicar a `src/connectors/digi.py`
+Substituir el mètode `extract_metrics_from_pdf` a `src/connectors/digi.py` per aquesta versió:
 
-```yaml
----
-# yamllint disable rule:line-length
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: grafana-dashboard-subministres-factures
-  namespace: monitoring
-  labels:
-    grafana_dashboard: "1"
-data:
-  06-subministres-factures.json: |
-    {
-      "annotations": { "list": [] },
-      "editable": true,
-      "fiscalYearStartMonth": 0,
-      "graphTooltip": 1,
-      "id": null,
-      "links": [],
-      "liveNow": false,
-      "panels": [
-        {
-          "collapsed": false,
-          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
-          "id": 100,
-          "title": "💶 Resum de Despesa en Subministraments (Última Facturació, Acumulat & Variació Interanual)",
-          "type": "row"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "color": { "mode": "thresholds" },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  { "color": "green", "value": null },
-                  { "color": "yellow", "value": 150 },
-                  { "color": "red", "value": 250 }
-                ]
-              },
-              "unit": "currencyEUR"
-            },
-            "overrides": []
-          },
-          "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
-          "id": 1,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "none",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-            "textMode": "auto"
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "from(bucket: \"energy_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r._field == \"import_total\")\n  |> group(columns: [\"proveidor\"])\n  |> last()\n  |> group()\n  |> sum()",
-              "refId": "A"
-            }
-          ],
-          "title": "💰 Total Últimes Factures",
-          "type": "stat"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "color": { "fixedColor": "blue", "mode": "fixed" },
-              "mappings": [],
-              "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] },
-              "unit": "currencyEUR"
-            },
-            "overrides": []
-          },
-          "gridPos": { "h": 4, "w": 3, "x": 4, "y": 1 },
-          "id": 2,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-            "textMode": "auto"
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "from(bucket: \"energy_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r.proveidor == \"veolia\" and r._field == \"import_total\")\n  |> group(columns: [\"proveidor\"])\n  |> sort(columns: [\"_time\"])\n  |> keep(columns: [\"_time\", \"_value\"])",
-              "refId": "A"
-            }
-          ],
-          "title": "💧 Aigua (Veolia)",
-          "type": "stat"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "color": { "fixedColor": "orange", "mode": "fixed" },
-              "mappings": [],
-              "thresholds": { "mode": "absolute", "steps": [{ "color": "orange", "value": null }] },
-              "unit": "currencyEUR"
-            },
-            "overrides": []
-          },
-          "gridPos": { "h": 4, "w": 3, "x": 7, "y": 1 },
-          "id": 3,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-            "textMode": "auto"
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "from(bucket: \"energy_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r.proveidor == \"catgas\" and r._field == \"import_total\")\n  |> group(columns: [\"proveidor\"])\n  |> sort(columns: [\"_time\"])\n  |> keep(columns: [\"_time\", \"_value\"])",
-              "refId": "A"
-            }
-          ],
-          "title": "🔥 Gas (Catgas)",
-          "type": "stat"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "color": { "fixedColor": "yellow", "mode": "fixed" },
-              "mappings": [],
-              "thresholds": { "mode": "absolute", "steps": [{ "color": "yellow", "value": null }] },
-              "unit": "currencyEUR"
-            },
-            "overrides": []
-          },
-          "gridPos": { "h": 4, "w": 3, "x": 10, "y": 1 },
-          "id": 4,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-            "textMode": "auto"
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "from(bucket: \"energy_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r.proveidor == \"bonpreu\" and r._field == \"import_total\")\n  |> group(columns: [\"proveidor\"])\n  |> sort(columns: [\"_time\"])\n  |> keep(columns: [\"_time\", \"_value\"])",
-              "refId": "A"
-            }
-          ],
-          "title": "⚡ Llum (Bonpreu)",
-          "type": "stat"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "color": { "fixedColor": "purple", "mode": "fixed" },
-              "mappings": [],
-              "thresholds": { "mode": "absolute", "steps": [{ "color": "purple", "value": null }] },
-              "unit": "currencyEUR"
-            },
-            "overrides": []
-          },
-          "gridPos": { "h": 4, "w": 3, "x": 13, "y": 1 },
-          "id": 5,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "area",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-            "textMode": "auto"
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "from(bucket: \"energy_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r.proveidor == \"digi\" and r._field == \"import_total\")\n  |> group(columns: [\"proveidor\"])\n  |> sort(columns: [\"_time\"])\n  |> keep(columns: [\"_time\", \"_value\"])",
-              "refId": "A"
-            }
-          ],
-          "title": "📱 Fibra & Mòbil (Digi)",
-          "type": "stat"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "color": { "fixedColor": "emerald", "mode": "fixed" },
-              "mappings": [],
-              "thresholds": { "mode": "absolute", "steps": [{ "color": "emerald", "value": null }] },
-              "unit": "currencyEUR"
-            },
-            "overrides": []
-          },
-          "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
-          "id": 11,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "none",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
-            "textMode": "auto"
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "from(bucket: \"energy_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r._field == \"import_total\")\n  |> filter(fn: (r) => \"$proveidor\" == \"All\" or r.proveidor == \"$proveidor\")\n  |> group()\n  |> sum()",
-              "refId": "A"
-            }
-          ],
-          "title": "🏦 Acumulat (Període)",
-          "type": "stat"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "color": { "mode": "thresholds" },
-              "decimals": 1,
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  { "color": "green", "value": null },
-                  { "color": "yellow", "value": 0 },
-                  { "color": "red", "value": 10 }
-                ]
-              },
-              "unit": "percent"
-            },
-            "overrides": []
-          },
-          "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
-          "id": 14,
-          "options": {
-            "colorMode": "value",
-            "graphMode": "none",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-            "textMode": "auto"
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "curr = from(bucket: \"energy_data\")\n  |> range(start: -1y, stop: now())\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r._field == \"import_total\")\n  |> filter(fn: (r) => \"$proveidor\" == \"All\" or r.proveidor == \"$proveidor\")\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with join_key: \"k\" }))\n\nprev = from(bucket: \"energy_data\")\n  |> range(start: -2y, stop: -1y)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r._field == \"import_total\")\n  |> filter(fn: (r) => \"$proveidor\" == \"All\" or r.proveidor == \"$proveidor\")\n  |> group()\n  |> sum()\n  |> map(fn: (r) => ({ r with join_key: \"k\" }))\n\njoin(tables: {curr: curr, prev: prev}, on: [\"join_key\"])\n  |> filter(fn: (r) => r._value_prev > 0.0)\n  |> map(fn: (r) => ({ _value: ((r._value_curr - r._value_prev) / r._value_prev) * 100.0 }))",
-              "refId": "A"
-            }
-          ],
-          "title": "🔄 Variació Interanual (12m YoY)",
-          "type": "stat"
-        },
-        {
-          "collapsed": false,
-          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
-          "id": 101,
-          "title": "📊 Evolució Històrica, Distribució i Comparativa Interanual (YoY)",
-          "type": "row"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "drawStyle": "bars",
-                "fillOpacity": 85,
-                "gradientMode": "none",
-                "lineWidth": 1,
-                "stacking": { "group": "A", "mode": "normal" }
-              },
-              "mappings": [],
-              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
-              "unit": "currencyEUR"
-            },
-            "overrides": [
-              { "matcher": { "id": "byName", "options": "veolia" }, "properties": [{ "id": "color", "value": { "fixedColor": "#3b82f6", "mode": "fixed" } }, { "id": "displayName", "value": "💧 Veolia (Aigua)" }] },
-              { "matcher": { "id": "byName", "options": "catgas" }, "properties": [{ "id": "color", "value": { "fixedColor": "#f97316", "mode": "fixed" } }, { "id": "displayName", "value": "🔥 Catgas (Gas)" }] },
-              { "matcher": { "id": "byName", "options": "bonpreu" }, "properties": [{ "id": "color", "value": { "fixedColor": "#eab308", "mode": "fixed" } }, { "id": "displayName", "value": "⚡ Bonpreu (Llum)" }] },
-              { "matcher": { "id": "byName", "options": "digi" }, "properties": [{ "id": "color", "value": { "fixedColor": "#a855f7", "mode": "fixed" } }, { "id": "displayName", "value": "📱 Digi (Fibra/Mòbil)" }] }
-            ]
-          },
-          "gridPos": { "h": 8, "w": 16, "x": 0, "y": 6 },
-          "id": 6,
-          "options": {
-            "legend": { "calcs": ["sum", "mean"], "displayMode": "table", "placement": "right", "showLegend": true },
-            "tooltip": { "mode": "multi", "sort": "desc" }
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "from(bucket: \"energy_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r._field == \"import_total\")\n  |> filter(fn: (r) => \"$proveidor\" == \"All\" or r.proveidor == \"$proveidor\")\n  |> group(columns: [\"proveidor\"])\n  |> aggregateWindow(every: 1mo, fn: sum, createEmpty: false, timeSrc: \"_start\")",
-              "refId": "A"
-            }
-          ],
-          "title": "📅 Despesa Mensual Apilada per Proveïdor (€)",
-          "type": "timeseries"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "color": { "mode": "palette-classic" },
-              "mappings": [],
-              "unit": "currencyEUR"
-            },
-            "overrides": [
-              { "matcher": { "id": "byName", "options": "veolia" }, "properties": [{ "id": "color", "value": { "fixedColor": "#3b82f6", "mode": "fixed" } }] },
-              { "matcher": { "id": "byName", "options": "catgas" }, "properties": [{ "id": "color", "value": { "fixedColor": "#f97316", "mode": "fixed" } }] },
-              { "matcher": { "id": "byName", "options": "bonpreu" }, "properties": [{ "id": "color", "value": { "fixedColor": "#eab308", "mode": "fixed" } }] },
-              { "matcher": { "id": "byName", "options": "digi" }, "properties": [{ "id": "color", "value": { "fixedColor": "#a855f7", "mode": "fixed" } }] }
-            ]
-          },
-          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
-          "id": 7,
-          "options": {
-            "displayLabels": ["percent", "value"],
-            "legend": { "displayMode": "table", "placement": "bottom", "values": ["value", "percent"] },
-            "pieType": "donut",
-            "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
-            "tooltip": { "mode": "single" }
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "from(bucket: \"energy_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r._field == \"import_total\")\n  |> group(columns: [\"proveidor\"])\n  |> sum()",
-              "refId": "A"
-            }
-          ],
-          "title": "🥧 Repartiment Total de la Despesa",
-          "type": "piechart"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "drawStyle": "bars",
-                "fillOpacity": 65,
-                "gradientMode": "none",
-                "lineWidth": 2
-              },
-              "mappings": [],
-              "unit": "currencyEUR"
-            },
-            "overrides": [
-              {
-                "matcher": { "id": "byName", "options": "Període Actual" },
-                "properties": [
-                  { "id": "color", "value": { "fixedColor": "#10b981", "mode": "fixed" } },
-                  { "id": "custom.drawStyle", "value": "bars" }
-                ]
-              },
-              {
-                "matcher": { "id": "byName", "options": "Any Anterior (YoY)" },
-                "properties": [
-                  { "id": "color", "value": { "fixedColor": "#f59e0b", "mode": "fixed" } },
-                  { "id": "custom.drawStyle", "value": "line" },
-                  { "id": "custom.lineStyle", "value": { "dash": [10, 6], "fill": "dash" } },
-                  { "id": "custom.fillOpacity", "value": 10 },
-                  { "id": "custom.showPoints", "value": "always" }
-                ]
-              }
-            ]
-          },
-          "gridPos": { "h": 7, "w": 24, "x": 0, "y": 14 },
-          "id": 13,
-          "options": {
-            "legend": { "calcs": ["sum", "mean"], "displayMode": "table", "placement": "right", "showLegend": true },
-            "tooltip": { "mode": "multi", "sort": "desc" }
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "from(bucket: \"energy_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r._field == \"import_total\")\n  |> filter(fn: (r) => \"$proveidor\" == \"All\" or r.proveidor == \"$proveidor\")\n  |> group()\n  |> aggregateWindow(every: 1mo, fn: sum, createEmpty: false, timeSrc: \"_start\")\n  |> map(fn: (r) => ({ r with serie: \"Període Actual\" }))\n  |> group(columns: [\"serie\"])",
-              "refId": "A"
-            },
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "import \"experimental\"\nfrom(bucket: \"energy_data\")\n  |> range(start: experimental.subDuration(d: 1y, from: v.timeRangeStart), stop: experimental.subDuration(d: 1y, from: v.timeRangeStop))\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r._field == \"import_total\")\n  |> filter(fn: (r) => \"$proveidor\" == \"All\" or r.proveidor == \"$proveidor\")\n  |> group()\n  |> aggregateWindow(every: 1mo, fn: sum, createEmpty: false, timeSrc: \"_start\")\n  |> timeShift(duration: 1y, columns: [\"_start\", \"_stop\", \"_time\"])\n  |> map(fn: (r) => ({ r with serie: \"Any Anterior (YoY)\" }))\n  |> group(columns: [\"serie\"])",
-              "refId": "B"
-            }
-          ],
-          "title": "🔄 Comparativa Interanual Mensual (YoY: Període Actual vs. Mateix Mes de l'Any Anterior)",
-          "type": "timeseries"
-        },
-        {
-          "collapsed": false,
-          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 21 },
-          "id": 102,
-          "title": "⚡💧🔥 Consums Físics i Preus Unitaris Reals",
-          "type": "row"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "drawStyle": "bars",
-                "fillOpacity": 75,
-                "gradientMode": "none",
-                "lineWidth": 1,
-                "stacking": { "group": "A", "mode": "normal" }
-              },
-              "mappings": [],
-              "unit": "kwh"
-            },
-            "overrides": [
-              { "matcher": { "id": "byName", "options": "consum_kwh_punta" }, "properties": [{ "id": "color", "value": { "fixedColor": "#ef4444", "mode": "fixed" } }, { "id": "displayName", "value": "🔴 P1 Punta" }] },
-              { "matcher": { "id": "byName", "options": "consum_kwh_pla" }, "properties": [{ "id": "color", "value": { "fixedColor": "#f59e0b", "mode": "fixed" } }, { "id": "displayName", "value": "🟡 P2 Pla" }] },
-              { "matcher": { "id": "byName", "options": "consum_kwh_vall" }, "properties": [{ "id": "color", "value": { "fixedColor": "#10b981", "mode": "fixed" } }, { "id": "displayName", "value": "🟢 P3 Vall" }] }
-            ]
-          },
-          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 22 },
-          "id": 8,
-          "options": {
-            "legend": { "calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-            "tooltip": { "mode": "multi", "sort": "desc" }
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "from(bucket: \"energy_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r.proveidor == \"bonpreu\")\n  |> filter(fn: (r) => r._field == \"consum_kwh_punta\" or r._field == \"consum_kwh_pla\" or r._field == \"consum_kwh_vall\")\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: 1mo, fn: sum, createEmpty: false, timeSrc: \"_start\")",
-              "refId": "A"
-            }
-          ],
-          "title": "⚡ Consum Elèctric Bonpreu per Trams (kWh)",
-          "type": "timeseries"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "drawStyle": "bars",
-                "fillOpacity": 70,
-                "gradientMode": "none",
-                "lineWidth": 1
-              },
-              "mappings": [],
-              "unit": "m3"
-            },
-            "overrides": [
-              { "matcher": { "id": "byName", "options": "veolia" }, "properties": [{ "id": "color", "value": { "fixedColor": "#0284c7", "mode": "fixed" } }, { "id": "displayName", "value": "💧 Aigua Veolia (m³)" }] },
-              { "matcher": { "id": "byName", "options": "catgas" }, "properties": [{ "id": "color", "value": { "fixedColor": "#ea580c", "mode": "fixed" } }, { "id": "displayName", "value": "🔥 Gas Catgas (m³)" }] }
-            ]
-          },
-          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 22 },
-          "id": 9,
-          "options": {
-            "legend": { "calcs": ["sum", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-            "tooltip": { "mode": "multi", "sort": "desc" }
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "from(bucket: \"energy_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and r._field == \"consum_m3\")\n  |> group(columns: [\"proveidor\"])\n  |> aggregateWindow(every: 1mo, fn: sum, createEmpty: false, timeSrc: \"_start\")",
-              "refId": "A"
-            }
-          ],
-          "title": "💧🔥 Consums de Fluid: Aigua & Gas (m³)",
-          "type": "timeseries"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "custom": {
-                "drawStyle": "line",
-                "fillOpacity": 20,
-                "lineInterpolation": "smooth",
-                "lineWidth": 2,
-                "showPoints": "always"
-              },
-              "decimals": 3,
-              "mappings": [],
-              "unit": "currencyEUR"
-            },
-            "overrides": [
-              { "matcher": { "id": "byName", "options": "bonpreu" }, "properties": [{ "id": "color", "value": { "fixedColor": "#eab308", "mode": "fixed" } }, { "id": "displayName", "value": "⚡ Llum (€/kWh tot inclòs)" }] },
-              { "matcher": { "id": "byName", "options": "catgas" }, "properties": [{ "id": "color", "value": { "fixedColor": "#f97316", "mode": "fixed" } }, { "id": "displayName", "value": "🔥 Gas (€/kWh tot inclòs)" }] }
-            ]
-          },
-          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 22 },
-          "id": 12,
-          "options": {
-            "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-            "tooltip": { "mode": "multi", "sort": "desc" }
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "from(bucket: \"energy_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\" and (r._field == \"import_total\" or r._field == \"consum_kwh\"))\n  |> pivot(rowKey: [\"_time\", \"numero_factura\", \"proveidor\"], columnKey: [\"_field\"], valueColumn: \"_value\")\n  |> filter(fn: (r) => exists r.consum_kwh and r.consum_kwh > 0.0)\n  |> map(fn: (r) => ({ _time: r._time, proveidor: r.proveidor, _value: r.import_total / r.consum_kwh }))\n  |> group(columns: [\"proveidor\"])\n  |> sort(columns: [\"_time\"])",
-              "refId": "A"
-            }
-          ],
-          "title": "📈 Cost Real de l'Energia (€/kWh amb impostos i fix)",
-          "type": "timeseries"
-        },
-        {
-          "collapsed": false,
-          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 },
-          "id": 103,
-          "title": "📋 Detall Històric de Factures",
-          "type": "row"
-        },
-        {
-          "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-          "fieldConfig": {
-            "defaults": {
-              "color": { "mode": "thresholds" },
-              "custom": { "align": "auto", "displayMode": "auto" },
-              "mappings": []
-            },
-            "overrides": [
-              { "matcher": { "id": "byName", "options": "import_total" }, "properties": [{ "id": "unit", "value": "currencyEUR" }, { "id": "displayName", "value": "Import Total" }] },
-              { "matcher": { "id": "byName", "options": "consum_kwh" }, "properties": [{ "id": "unit", "value": "kwh" }, { "id": "displayName", "value": "Consum (kWh)" }] },
-              { "matcher": { "id": "byName", "options": "consum_m3" }, "properties": [{ "id": "unit", "value": "m3" }, { "id": "displayName", "value": "Consum (m³)" }] },
-              { "matcher": { "id": "byName", "options": "proveidor" }, "properties": [{ "id": "custom.displayMode", "value": "color-text" }, { "id": "displayName", "value": "Proveïdor" }] },
-              { "matcher": { "id": "byName", "options": "numero_factura" }, "properties": [{ "id": "displayName", "value": "Núm. Factura" }] }
-            ]
-          },
-          "gridPos": { "h": 9, "w": 24, "x": 0, "y": 31 },
-          "id": 10,
-          "options": {
-            "footer": { "countRows": false, "fields": ["import_total", "consum_kwh", "consum_m3"], "reducer": ["sum"], "show": true },
-            "showHeader": true,
-            "sortBy": [{ "desc": true, "displayName": "Time" }]
-          },
-          "pluginVersion": "10.0.0",
-          "targets": [
-            {
-              "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-              "query": "from(bucket: \"energy_data\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"factures_subministres\")\n  |> filter(fn: (r) => \"$proveidor\" == \"All\" or r.proveidor == \"$proveidor\")\n  |> pivot(rowKey:[\"_time\", \"numero_factura\"], columnKey: [\"_field\"], valueColumn: \"_value\")\n  |> group()\n  |> sort(columns: [\"_time\"], desc: true)",
-              "refId": "A"
-            }
-          ],
-          "title": "📑 Registre de Factures Processades",
-          "type": "table"
-        }
-      ],
-      "refresh": "1m",
-      "schemaVersion": 39,
-      "tags": ["subministres", "factures", "energia", "influxdb", "aigua", "gas", "telefonia"],
-      "templating": {
-        "list": [
-          {
-            "allValue": "All",
-            "current": { "selected": true, "text": "All", "value": "$__all" },
-            "datasource": { "type": "influxdb", "uid": "PD04B56A68C70BDF8" },
-            "definition": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"energy_data\", tag: \"proveidor\", predicate: (r) => r._measurement == \"factures_subministres\")",
-            "hide": 0,
-            "includeAll": true,
-            "label": "Proveïdor",
-            "multi": false,
-            "name": "proveidor",
-            "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"energy_data\", tag: \"proveidor\", predicate: (r) => r._measurement == \"factures_subministres\")",
-            "refresh": 1,
-            "type": "query"
-          }
+```python
+    def extract_metrics_from_pdf(self, pdf_bytes: bytes) -> FacturaMetriques | None:
+        """Parseja el PDF de factura de Digi Mobil de forma robusta."""
+        text = extract_text_from_pdf_bytes(pdf_bytes)
+        if not text:
+            return None
+
+        # 1. Número de factura (ex: FACTURA Número: DGFC2210546467)
+        num_factura = extract_regex_first(
+            text, r"(?:FACTURA\s+N[úu]mero|N[úu]mero\s*de\s*factura|Factura\s*n[úu]m\.?):?\s*([A-Za-z0-9/_-]+)"
+        )
+        if not num_factura:
+            num_factura = extract_regex_first(text, r"\b(DGFC\d{6,15})\b")
+        if not num_factura:
+            num_factura = extract_regex_first(text, r"Factura\s+([A-Za-z0-9/_-]{6,20})")
+
+        # 2. Període facturat (ex: "16 de septiembre de 2026 a 15 de octubre de 2026" o "01/09/2026 - 30/09/2026")
+        dt_inici, dt_fi = extract_date_range(
+            text,
+            r"(?:Per[íi]odo\s*(?:de\s*)?facturaci[óo]n|Per[íi]ode\s*facturat|Per[íi]ode):?\s*"
+            r"(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})"
+            r"\s*(?:al|fins\s*a|a|-)\s*"
+            r"(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})",
+        )
+
+        # 3. Data d'emissió (suportant tant dd/mm/yyyy com "16 de octubre de 2026")
+        data_str = extract_regex_first(
+            text,
+            r"(?:Fecha\s*(?:de\s*)?emisi[óo]n|Data\s*(?:d')?emissi[óo]|Fecha\s*factura):?\s*\n?\s*"
+            r"(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})",
+        )
+        data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
+
+        # Si no ha trobat l'etiqueta explícita, usem la data de fi del període facturat (que sempre és el mes de la factura)
+        if not data_emissio and dt_fi:
+            data_emissio = dt_fi
+
+        # Si encara no tenim data, busquem qualsevol data explícita al primer terç del document
+        if not data_emissio:
+            any_date_str = extract_regex_first(
+                text[:1500],
+                r"\b(\d{1,2}\s+de\s+[a-zA-ZÀ-ÿ]+\s+de\s+20\d{2}|\d{1,2}[/-]\d{1,2}[/-]20\d{2})\b",
+            )
+            if any_date_str:
+                data_emissio = parse_date_catalan_spanish(any_date_str)
+
+        # IMPORTANT: Eliminada la deducció errònia DGFC(\d{2})(\d{2}) perquè el prefix '22' de DGFC22...
+        # és un codi de sèrie fix de Digi i NO l'any 2022!
+
+        # 4. Import total (cercant específicament els patrons d'import amb coma decimal de Digi)
+        total_eur: float | None = None
+        digi_total_patterns = [
+            r"(?:TOTAL\s+A\s+PAGAR|TOTAL\s+FACTURA|Importe\s+total|Total\s+factura)[^0-9€]{0,60}?(\d{1,3}[.,]\d{2})\s*€",
+            r"(\d{1,3}[.,]\d{2})\s*€\s*(?:TOTAL\s+FACTURA|TOTAL\s+A\s+PAGAR)",
+            r"TOTAL\s+SERVICIOS[^0-9€]{0,40}?(\d{1,3}[.,]\d{2})\s*€",
         ]
-      },
-      "time": { "from": "now-1y", "to": "now" },
-      "timepicker": {
-        "refresh_intervals": ["1m", "5m", "15m", "1h", "6h", "1d"]
-      },
-      "timezone": "browser",
-      "title": "Subministres & Facturació Domèstica",
-      "uid": "subministres-facturacio",
-      "version": 3
+        for pat in digi_total_patterns:
+            val = extract_float_value(text, pat)
+            if val is not None and 0.5 <= val <= 400.0:
+                total_eur = val
+                break
+
+        if total_eur is None:
+            # Cercar tots els imports en format XX,XX € i agafar l'últim del bloc de resum (fins a 400 €)
+            all_euro_matches = re.findall(r"\b(\d{1,3},\d{2})\s*€", text)
+            valid_amounts = []
+            for m_str in all_euro_matches:
+                v = extract_float_value(m_str, r"(\d{1,3},\d{2})")
+                if v is not None and 1.0 <= v <= 400.0:
+                    valid_amounts.append(v)
+            if valid_amounts:
+                total_eur = max(valid_amounts)
+
+        if total_eur is None:
+            return None
+
+        # 5. Dades addicionals de telefonia
+        total_gb = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*GB")
+
+        return FacturaMetriques(
+            proveidor=self.name,
+            tipus=self.tipus,
+            numero_factura=num_factura or f"DIGI-{date.today().isoformat()}",
+            data_emissio=data_emissio or date.today(),
+            periode_inici=dt_inici,
+            periode_fi=dt_fi,
+            dies_facturats=(dt_fi - dt_inici).days if (dt_inici and dt_fi) else None,
+            import_total=float(total_eur),
+            total_gb_consumits=total_gb,
+        )
+```
+
+---
+
+## 2. Ordenar per Data Real de Factura (`date_iso`) i Afegir Reparació Automàtica (`/api/reparse`) a `src/web/app.py`
+
+### Problema
+1. `list_nas_invoices()` ordenava per `x["modified"]` (data d'escriptura del fitxer al disc) en comptes de `x["date_iso"]` (any i mes real de la factura). Això feia que l'última factura descarregada d'un històric (la més vella, ex: 2022) aparegués la primera a la taula i a les targetes superiors (`last_by_provider`)!
+2. Les factures de Digi que ja es van desar amb `2022_...` al nom del fitxer i amb l'import malament a InfluxDB necessiten un endpoint `/api/reparse` que llegeixi els PDFs del NAS, corregeixi el nom/carpeta si l'any/mes estava malament i actualitzi InfluxDB.
+
+### Canvi 1: A `list_nas_invoices()` dins `src/web/app.py` (línia 300)
+Substituir l'ordenació final de `list_nas_invoices()`:
+```python
+    # Ordenar per data real de la factura descendent (i per data de modificació/nom en cas d'empat)
+    invoices.sort(key=lambda x: (x["date_iso"], x["modified"], x["filename"]), reverse=True)
+    return invoices
+```
+
+### Canvi 2: Afegir `reparse_and_fix_nas_invoices()` i l'endpoint `@app.post("/api/reparse")` a `src/web/app.py`
+Afegir aquestes funcions a `src/web/app.py` (just abans d'`index`):
+
+```python
+def reparse_and_fix_nas_invoices() -> tuple[int, int]:
+    """Re-analitza tots els PDFs del NAS, reanomena/mou els que tenien data errònia (ex: 2022) i actualitza InfluxDB."""
+    root = Path(settings.NAS_MOUNT_PATH)
+    if not root.exists():
+        return 0, 0
+
+    _pdf_amount_cache.clear()
+    processed = 0
+    renamed = 0
+
+    all_pdfs = list(root.glob("**/*.pdf"))
+    total = len(all_pdfs)
+
+    for idx, pdf_path in enumerate(all_pdfs, start=1):
+        try:
+            rel_path = pdf_path.relative_to(root)
+            parts = rel_path.parts
+            proveidor = parts[1].lower() if len(parts) > 1 else ""
+            conn = CONNECTORS_MAP.get(proveidor)
+            if not conn:
+                continue
+
+            if main_loop and main_loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    ws_manager.broadcast_progress(
+                        {
+                            "connector": proveidor.upper(),
+                            "step": f"🔄 Re-analitzant PDF {pdf_path.name}...",
+                            "current": idx,
+                            "total": total,
+                            "percent": int((idx / total) * 100),
+                            "status": "running",
+                        }
+                    ),
+                    main_loop,
+                )
+
+            pdf_bytes = pdf_path.read_bytes()
+            metriques = conn.extract_metrics_from_pdf(pdf_bytes)
+            if not metriques:
+                continue
+
+            # Verificar si el fitxer tenia un any o mes erroni al nom (ex: 2022_10_digi_... quan és del 2026)
+            any_correcte = str(metriques.data_emissio.year)
+            mes_correcte = f"{metriques.data_emissio.month:02d}"
+            clean_num = metriques.numero_factura.replace("/", "_").replace("\\", "_").replace(" ", "")
+            expected_filename = f"{any_correcte}_{mes_correcte}_{conn.name}_{clean_num}.pdf"
+            expected_dir = storage.get_destination_dir(conn.tipus.value, conn.name, any_correcte)
+            expected_path = expected_dir / expected_filename
+
+            if pdf_path.resolve() != expected_path.resolve():
+                expected_path.write_bytes(pdf_bytes)
+                pdf_path.unlink(missing_ok=True)
+                renamed += 1
+                logger.info(f"🔧 Corregida ubicació/data: {pdf_path.name} -> {expected_path.name}")
+
+            # Netejar mètrica antiga a InfluxDB i escriure la nova corregida
+            influx_writer.delete_factura_metrics(proveidor, metriques.numero_factura)
+            influx_writer.write_factura_metrics(metriques)
+            processed += 1
+        except (OSError, RuntimeError, ValueError) as err:
+            logger.warning(f"Error re-analitzant {pdf_path.name}: {err}")
+
+    return processed, renamed
+
+
+@app.post("/api/reparse")
+async def trigger_reparse(background_tasks: BackgroundTasks):
+    """Re-analitza tots els PDFs del NAS per corregir dates (ex: 2022) i imports a InfluxDB."""
+    if execution_state["is_running"]:
+        return HTMLResponse(
+            '<div class="p-4 mb-4 text-sm text-yellow-300 rounded-xl bg-yellow-950/60 border border-yellow-700/50">'
+            "⚠️ Ja hi ha una tasca en curs. Espera que finalitzi.</div>"
+        )
+
+    def _task():
+        execution_state["is_running"] = True
+        execution_state["active_connector"] = "REPARACIÓ NAS & INFLUXDB"
+        try:
+            proc, ren = reparse_and_fix_nas_invoices()
+            msg = (
+                f"✅ Reparació completada: {proc} factures re-analitzades i actualitzades a InfluxDB "
+                f"({ren} fitxers moguts a la seva data correcta)."
+            )
+            logger.info(msg)
+            if main_loop and main_loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    ws_manager.broadcast_status({"status": "ok", "message": msg, "new_count": proc}),
+                    main_loop,
+                )
+        finally:
+            execution_state["is_running"] = False
+            execution_state["active_connector"] = None
+
+    background_tasks.add_task(_task)
+    return HTMLResponse(
+        '<div class="p-4 mb-4 text-sm text-blue-300 rounded-xl bg-blue-950/60 border border-blue-700/50">'
+        "🔄 Re-analitzant tots els PDFs del NAS per corregir imports i dates errònies... La pàgina es recarregarà en acabar.</div>"
+    )
+```
+
+---
+
+## 3. Corregir el Filtre de Dates, el Botó "⭐ Últimes factures" i afegir el Botó "🔧 Reparar Imports/Dates" a `src/web/templates/index.html`
+
+### Problema al JavaScript d'`index.html`
+1. `filterInvoices()` decidia quina era l'"Última factura" agafant simplement la primera fila que trobava a la taula (`seenProviders.has(rProv)`). Si l'usuari havia ordenat la taula per Import ascendent o per Any ascendent, el botó "Últimes factures" mostrava la factura més antiga o la més barata!
+2. En el filtre de dates (`dFrom` / `dTo`), com que `data-date` és sempre `YYYY-MM-01` (primer dia del mes), si l'usuari selecciona `De: 2026-10-10`, les factures d'octubre (`2026-10-01`) quedaven excloses! Cal comparar a nivell de mes (`YYYY-MM`) o ajustar l'interval.
+
+### Canvi 1: Afegir el botó "Reparar Dates/Imports" a la barra d'eines de la taula a `src/web/templates/index.html` (al costat del botó de `resetFilters`)
+```html
+          <!-- Botó Reparar i Recalcular PDFs del NAS -->
+          <button 
+            type="button"
+            hx-post="/api/reparse"
+            hx-target="#notification-area"
+            title="Re-analitza tots els PDFs del NAS, corregeix dates errònies (ex: 2022) i actualitza els imports a InfluxDB"
+            class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-amber-950/50 hover:bg-amber-900/70 text-amber-300 border border-amber-800/60 text-xs font-medium transition cursor-pointer">
+            <i data-lucide="wrench" class="w-3.5 h-3.5 text-amber-400"></i>
+            <span>Reparar PDFs</span>
+          </button>
+```
+
+### Canvi 2: Substituir `filterInvoices()` a `src/web/templates/index.html`
+Substituir la funció `filterInvoices()` sencera perquè:
+1. Calculi primer quina és realment la factura amb la data més recent (`maxDateByProvider`) per a cada proveïdor (comparant `data-date` + `data-filename`), sense importar com estigui ordenada la taula.
+2. Compari el filtre de dates per mes (`YYYY-MM`) perquè seleccionar qualsevol dia dins d'un mes inclogui les factures d'aquell mes.
+
+```javascript
+    function filterInvoices() {
+      const q = document.querySelector('#search-input')?.value.toLowerCase().trim() || '';
+      const prov = document.querySelector('#provider-filter')?.value.toLowerCase() || 'all';
+      const dFrom = document.querySelector('#date-from')?.value || '';
+      const dTo = document.querySelector('#date-to')?.value || '';
+      const rows = Array.from(document.querySelectorAll('.invoice-row'));
+      let visibleCount = 0;
+
+      // 1. Si "Últimes factures" està actiu, trobar primer quina és la fila amb data més recent de cada proveïdor
+      const latestRowByProvider = new Map();
+      if (onlyLatestActive) {
+        rows.forEach(r => {
+          const rProv = r.getAttribute('data-provider') || '';
+          const rDate = r.getAttribute('data-date') || '';
+          const rFile = r.getAttribute('data-filename') || '';
+          const sortKey = `${rDate}_${rFile}`;
+
+          const currentBest = latestRowByProvider.get(rProv);
+          if (!currentBest || sortKey > currentBest.key) {
+            latestRowByProvider.set(rProv, { key: sortKey, row: r });
+          }
+        });
+      }
+
+      // Convertim dFrom i dTo a YYYY-MM per comparar amb el mes de facturació
+      const monthFrom = dFrom ? dFrom.slice(0, 7) : '';
+      const monthTo = dTo ? dTo.slice(0, 7) : '';
+
+      rows.forEach(r => {
+        const text = r.textContent?.toLowerCase() || '';
+        const rProv = r.getAttribute('data-provider') || r.querySelector('td:first-child')?.textContent?.toLowerCase().trim() || '';
+        const rDate = r.getAttribute('data-date') || '';
+        const rMonth = rDate ? rDate.slice(0, 7) : '';
+
+        const matchesText = !q || text.includes(q);
+        const matchesProv = (prov === 'all') || (rProv === prov);
+
+        let matchesDate = true;
+        if (monthFrom && rMonth) {
+          matchesDate = matchesDate && (rMonth >= monthFrom);
+        }
+        if (monthTo && rMonth) {
+          matchesDate = matchesDate && (rMonth <= monthTo);
+        }
+
+        let isLatestAllowed = true;
+        if (onlyLatestActive) {
+          const best = latestRowByProvider.get(rProv);
+          isLatestAllowed = best ? (best.row === r) : false;
+        }
+
+        if (matchesText && matchesProv && matchesDate && isLatestAllowed) {
+          r.style.display = '';
+          visibleCount++;
+        } else {
+          r.style.display = 'none';
+        }
+      });
+
+      const countElem = document.querySelector('#visible-count');
+      if (countElem) {
+        countElem.textContent = visibleCount;
+      }
     }
 ```
 
 ```
+
+Un cop l'agent apliqui aquests canvis i s'actualitzi el contenidor, només hauràs de fer clic un cop al nou botó **"🔧 Reparar PDFs"** de la taula: ell mateix re-analitzarà les factures de Digi, mourà les que s'havien guardat com a `2022_...` al seu any i mes reals, i sobreescriurà els imports bons a InfluxDB i a la web!

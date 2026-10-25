@@ -302,6 +302,17 @@
             class="p-2 rounded-lg bg-slate-950 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-800 transition">
             <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
           </button>
+
+          <!-- Botó Reparar i Recalcular PDFs del NAS -->
+          <button 
+            type="button"
+            hx-post="/api/reparse"
+            hx-target="#notification-area"
+            title="Re-analitza tots els PDFs del NAS, corregeix dates errònies (ex: 2022) i actualitza els imports a InfluxDB"
+            class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-amber-950/50 hover:bg-amber-900/70 text-amber-300 border border-amber-800/60 text-xs font-medium transition cursor-pointer">
+            <i data-lucide="wrench" class="w-3.5 h-3.5 text-amber-400"></i>
+            <span>Reparar PDFs</span>
+          </button>
         </div>
       </div>
 
@@ -635,41 +646,55 @@
       const prov = document.querySelector('#provider-filter')?.value.toLowerCase() || 'all';
       const dFrom = document.querySelector('#date-from')?.value || '';
       const dTo = document.querySelector('#date-to')?.value || '';
-      const rows = document.querySelectorAll('.invoice-row');
+      const rows = Array.from(document.querySelectorAll('.invoice-row'));
       let visibleCount = 0;
 
-      // Seguiment de proveïdors ja mostrats si el mode "només darreres" està actiu
-      const seenProviders = new Set();
+      // 1. Si "Últimes factures" està actiu, trobar primer quina és la fila amb data més recent de cada proveïdor
+      const latestRowByProvider = new Map();
+      if (onlyLatestActive) {
+        rows.forEach(r => {
+          const rProv = r.getAttribute('data-provider') || '';
+          const rDate = r.getAttribute('data-date') || '';
+          const rFile = r.getAttribute('data-filename') || '';
+          const sortKey = `${rDate}_${rFile}`;
+
+          const currentBest = latestRowByProvider.get(rProv);
+          if (!currentBest || sortKey > currentBest.key) {
+            latestRowByProvider.set(rProv, { key: sortKey, row: r });
+          }
+        });
+      }
+
+      // Convertim dFrom i dTo a YYYY-MM per comparar amb el mes de facturació
+      const monthFrom = dFrom ? dFrom.slice(0, 7) : '';
+      const monthTo = dTo ? dTo.slice(0, 7) : '';
 
       rows.forEach(r => {
         const text = r.textContent?.toLowerCase() || '';
         const rProv = r.getAttribute('data-provider') || r.querySelector('td:first-child')?.textContent?.toLowerCase().trim() || '';
         const rDate = r.getAttribute('data-date') || '';
+        const rMonth = rDate ? rDate.slice(0, 7) : '';
 
         const matchesText = !q || text.includes(q);
         const matchesProv = (prov === 'all') || (rProv === prov);
 
         let matchesDate = true;
-        if (dFrom && rDate) {
-          matchesDate = matchesDate && (rDate >= dFrom);
+        if (monthFrom && rMonth) {
+          matchesDate = matchesDate && (rMonth >= monthFrom);
         }
-        if (dTo && rDate) {
-          matchesDate = matchesDate && (rDate <= dTo);
+        if (monthTo && rMonth) {
+          matchesDate = matchesDate && (rMonth <= monthTo);
         }
 
         let isLatestAllowed = true;
         if (onlyLatestActive) {
-          if (seenProviders.has(rProv)) {
-            isLatestAllowed = false;
-          }
+          const best = latestRowByProvider.get(rProv);
+          isLatestAllowed = best ? (best.row === r) : false;
         }
 
         if (matchesText && matchesProv && matchesDate && isLatestAllowed) {
           r.style.display = '';
           visibleCount++;
-          if (onlyLatestActive) {
-            seenProviders.add(rProv);
-          }
         } else {
           r.style.display = 'none';
         }

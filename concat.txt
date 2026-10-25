@@ -729,7 +729,7 @@ class Settings(BaseSettings):
     SCRAPER_TIMEOUT_MS: int = Field(default=30000)
     MAX_SCRAPER_RETRIES: int = Field(default=3, description="Màxim d'intents abans de bloqueig preventiu")
     SCRAPER_COOLDOWN_MINUTES: int = Field(default=60, description="Minuts de cooldown per evitar bloquejos de compte")
-    BONPREU_PORTAL_URL: str = Field(default="https://www.bonpreuesclat.cat/energia")
+    BONPREU_PORTAL_URL: str = Field(default="https://energia.bonpreuesclat.cat/factures")
     DIGI_PORTAL_URL: str = Field(default="https://midigi.digimobil.es")
 
 
@@ -1036,7 +1036,8 @@ class BonpreuConnector(BaseConnector):
                 return results
 
             self.report_progress("🌐 Iniciant descàrrega de factures des del portal de Bonpreu Energia...")
-            pdf_list = self.fetch_invoices_from_portal(imap_client=imap_client, limit=fetch_limit)
+            portal_limit = 1 if mode == "latest" else limit
+            pdf_list = self.fetch_invoices_from_portal(imap_client=imap_client, limit=portal_limit)
             total_dl = len(pdf_list)
             for idx, (pdf_bytes, filename) in enumerate(pdf_list, start=1):
                 self.report_progress(
@@ -1077,30 +1078,29 @@ class BonpreuConnector(BaseConnector):
         except OSError:
             pass
 
-        portal_url = settings.BONPREU_PORTAL_URL or self.PORTAL_LOGIN_URL
+        portal_url = "https://energia.bonpreuesclat.cat/factures"
         try:
+            self.report_progress("🌐 Iniciant navegador headless Chromium per a Bonpreu...")
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=settings.HEADLESS_BROWSER)
                 try:
                     context_kwargs: dict[str, Any] = {"accept_downloads": True}
                     if session_file.exists():
-                        self.logger.info("Carregant sessió prèvia de Bonpreu des del NAS...")
+                        self.report_progress("🌐 Carregant sessió prèvia de Bonpreu des del NAS...")
                         context_kwargs["storage_state"] = str(session_file)
 
                     context = browser.new_context(**context_kwargs)
                     page = context.new_page()
 
-                    self.logger.info(f"Obrint portal de Bonpreu Energia: {portal_url}")
-                    page.goto(portal_url, timeout=settings.SCRAPER_TIMEOUT_MS)
-                    page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+                    self.report_progress(f"🌐 Obrint portal de factures de Bonpreu ({portal_url})...")
+                    page.goto(portal_url, wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS)
+                    page.wait_for_timeout(3000)
 
-                    # 1. Acceptar cookies si apareix el diàleg d'OneTrust
+                    # 1. Acceptar cookies o eliminar overlay si bloqueja
                     try:
-                        cookie_btn = page.query_selector(
-                            "#accept-recommended-btn-handler, button:has-text('Acceptar-ho tot')"
+                        page.evaluate(
+                            "() => { const el = document.querySelector('#onetrust-consent-sdk'); if (el) el.remove(); }"
                         )
-                        if cookie_btn and cookie_btn.is_visible():
-                            cookie_btn.click()
                     except (PlaywrightError, OSError):
                         pass
 
@@ -1108,101 +1108,189 @@ class BonpreuConnector(BaseConnector):
                     if (
                         "keycloak" in page.url.lower()
                         or "login" in page.url.lower()
+                        or "protocol/openid" in page.url.lower()
                         or page.query_selector("#kc-form-login")
+                        or page.query_selector("input#username")
                     ):
-                        self.logger.info("Sessió no activa a Bonpreu. Iniciant procés de login a Keycloak...")
+                        self.report_progress(f"🔑 Sessió no activa. Iniciant login per a '{settings.BONPREU_USER}'...")
 
-                        # Omplir formulari de credencials
+                        # Eliminar overlay de cookies abans d'interactuar
+                        page.evaluate(
+                            "() => { const el = document.querySelector('#onetrust-consent-sdk'); if (el) el.remove(); }"
+                        )
+                        page.wait_for_timeout(500)
+
                         page.fill("input#username, input[name='username']", settings.BONPREU_USER or "")
                         page.fill("input#password, input[name='password']", settings.BONPREU_PASSWORD or "")
-                        page.click("button.accedeix, button[type='submit']")
-                        page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+
+                        with page.expect_navigation(wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS):
+                            page.evaluate(
+                                "() => { const f = document.querySelector('#kc-form-login'); if (f) f.submit(); }"
+                            )
+                        page.wait_for_timeout(3000)
 
                         # 3. Detecció de pantalla de 2FA (Verifica la teva identitat / kc-email-totp-code-login-form)
                         is_2fa = (
-                            "email-totp" in page.url.lower()
+                            "totp" in page.url.lower()
+                            or "identitat" in page.title().lower()
                             or page.query_selector("#kc-email-totp-code-login-form") is not None
                             or page.query_selector("input#code") is not None
                         )
 
                         if is_2fa:
-                            self.logger.info("🔐 Bonpreu sol·licita verificació 2FA...")
+                            self.report_progress("🔐 Bonpreu sol·licita codi 2FA per correu...", status="warning")
                             code_to_use = otp_code
 
                             # PLA A: Intentar recuperar el codi 2FA automàticament de la bústia IMAP
                             if not code_to_use and imap_client and imap_client.is_configured():
-                                self.logger.info("Intentant extreure el codi 2FA de la bústia de correu (Pla A)...")
+                                self.report_progress("📧 Cercant codi 2FA de Bonpreu a la bústia de correu...")
                                 code_to_use = self._fetch_otp_code_from_email(imap_client, timeout_seconds=75)
 
                             # Si tenim el codi (automàtic o proporcionat per l'usuari)
                             if code_to_use:
-                                self.logger.info(f"Aplicant codi 2FA a Bonpreu: {code_to_use}")
-                                page.fill("input#code", code_to_use)
-                                page.click(".verify-button, button[type='submit']")
-                                page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
-                            else:
-                                # PLA B: Fallback / Pendent de 2FA
-                                self.logger.warning(
-                                    "🔐 No s'ha pogut obtenir el codi 2FA automàticament. "
-                                    "Estat: 'Pendent de 2FA'. Pots introduir el codi manualment des de la web."
-                                )
+                                self.report_progress(f"🔐 Aplicant codi 2FA a Bonpreu: {code_to_use}...")
+                                # Eliminar overlay de cookies si existeix
                                 try:
-                                    screenshot_path = session_dir / "bonpreu_2fa_prompt.png"
-                                    page.screenshot(path=str(screenshot_path))
-                                except (OSError, RuntimeError):
+                                    page.evaluate(
+                                        "() => { const el = document.querySelector('#onetrust-consent-sdk'); if (el) el.remove(); }"
+                                    )
+                                except (PlaywrightError, OSError):
                                     pass
+
+                                page.fill("input#code", code_to_use)
+                                page.dispatch_event("input#code", "input")
+                                page.dispatch_event("input#code", "change")
+                                page.wait_for_timeout(500)
+                                with page.expect_navigation(
+                                    wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS
+                                ):
+                                    page.evaluate(
+                                        "() => { const b = document.querySelector('.verify-button'); if (b) { b.disabled = false; b.click(); } else { const f = document.querySelector('#kc-email-totp-code-login-form'); if (f) f.submit(); } }"
+                                    )
+                                page.wait_for_timeout(5000)
+                            else:
+                                msg = "🔐 Bonpreu requereix codi 2FA enviat per correu. Introdueix-lo o torna a provar."
+                                self.record_failure(msg)
+                                self.report_progress(f"⚠️ {msg}", status="warning")
                                 return downloaded
 
-                    # 4. Si hem superat el login amb èxit, desem la sessió al NAS
-                    if "keycloak" not in page.url.lower():
+                    # 4. Esperar que finalitzi l'intercanvi de token i la redirecció a energia.bonpreuesclat.cat
+                    for _ in range(15):
+                        if (
+                            "energia.bonpreuesclat.cat" in page.url
+                            and "connect" not in page.url
+                            and "keycloak" not in page.url
+                        ):
+                            break
+                        page.wait_for_timeout(1000)
+
+                    # Si hem accedit amb èxit, desem la sessió al NAS
+                    if "energia.bonpreuesclat.cat" in page.url and "keycloak" not in page.url:
                         try:
                             context.storage_state(path=str(session_file))
-                            self.logger.info("✅ Sessió de Bonpreu desada al NAS per a futures execucions!")
+                            self.report_progress("✅ Sessió de Bonpreu desada al NAS!")
                         except (OSError, RuntimeError):
                             pass
 
-                    # 5. Navegar a l'apartat de factures si no hi som
+                    # 5. Assegurar que som a la pàgina de factures
                     if "factur" not in page.url.lower():
-                        factura_link = page.query_selector("a[href*='factur'], button:has-text('Factur')")
-                        if factura_link:
-                            factura_link.click()
-                            page.wait_for_load_state("networkidle", timeout=settings.SCRAPER_TIMEOUT_MS)
+                        self.report_progress("🌐 Accedint a l'apartat de factures de Bonpreu...")
+                        page.goto(portal_url, wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS)
+                        page.wait_for_timeout(4000)
 
-                    # 6. Cerca botons de descàrrega de PDF
-                    download_buttons = page.query_selector_all(
-                        "a[href*='.pdf'], button:has-text('Descarregar'), a:has-text('PDF'), button:has-text('PDF')"
-                    )
-                    total_found = len(download_buttons)
-                    max_dl = min(limit, total_found) if limit is not None else total_found
-                    self.report_progress(
-                        f"🌐 Trobats {total_found} enllaços de descàrrega a Bonpreu. Iniciant {max_dl}...",
-                        current=0,
-                        total=max_dl,
-                    )
+                    # 6. Cerca botons de descàrrega de PDF amb paginació (SEGÜENT)
+                    from src.storage import storage
 
-                    for i, btn in enumerate(download_buttons[:max_dl], start=1):
+                    has_more = True
+                    page_num = 1
+                    download_count = 0
+
+                    while has_more and page_num <= 5:
+                        self.report_progress(f"🌐 Explorant pàgina {page_num} de factures de Bonpreu...")
+                        page.wait_for_timeout(3000)
+
+                        rows = page.query_selector_all("tr")
+                        candidate_rows = []
+                        for r in rows:
+                            btn = r.query_selector("button:has-text('DESCARREGAR'), button:has-text('DESCARGAR')")
+                            if btn:
+                                candidate_rows.append((r, btn))
+
+                        total_on_page = len(candidate_rows)
+                        if total_on_page == 0:
+                            break
+
                         self.report_progress(
-                            f"⬇️ Descarregant factura {i} de {max_dl} del portal Bonpreu...",
-                            current=i,
-                            total=max_dl,
+                            f"🌐 Trobades {total_on_page} factures a la pàgina {page_num}. Comprovant quines falten al NAS...",
+                            current=0,
+                            total=total_on_page,
                         )
-                        try:
-                            with page.expect_download(timeout=15000) as download_info:
-                                btn.click()
-                            download = download_info.value
-                            path = download.path()
-                            if path:
-                                with open(path, "rb") as f:
-                                    downloaded.append((f.read(), download.suggested_filename or f"bonpreu_{i}.pdf"))
-                        except PlaywrightTimeoutError:
+
+                        for i, (r, btn) in enumerate(candidate_rows, start=1):
+                            tds = r.query_selector_all("td")
+                            num = tds[0].inner_text().strip() if tds else ""
+                            data_str = tds[1].inner_text().strip() if len(tds) > 1 else ""
+                            clean_num = re.sub(r"[^A-Za-z0-9_-]", "", num)
+                            any_clean = re.sub(r"[^0-9]", "", data_str.split("/")[-1]) if "/" in data_str else "2026"
+                            any_str = any_clean if len(any_clean) == 4 else "2026"
+
+                            dest_dir = storage.get_destination_dir(self.tipus.value, self.name, any_str)
+                            ja_al_nas = any(clean_num in f.name for f in dest_dir.glob("*.pdf")) if clean_num else False
+
+                            if ja_al_nas:
+                                self.report_progress(
+                                    f"⏭️ Factura Bonpreu {clean_num} ({data_str}) ja és al NAS. Ometent.",
+                                    current=i,
+                                    total=total_on_page,
+                                )
+                                continue
+
+                            if limit is not None and download_count >= limit:
+                                has_more = False
+                                break
+
                             self.report_progress(
-                                f"⏱️ Timeout (15s) descarregant factura {i}/{max_dl}. Saltant a la següent...",
+                                f"⬇️ Descarregant factura nova {clean_num} ({data_str}) del portal Bonpreu...",
                                 current=i,
-                                total=max_dl,
-                                status="warning",
+                                total=total_on_page,
                             )
-                        except (PlaywrightError, TimeoutError, OSError) as err:
-                            self.logger.warning(f"No s'ha pogut descarregar el botó {i}: {err}")
+                            try:
+                                with page.expect_download(timeout=20000) as download_info:
+                                    page.evaluate("el => el.click()", btn)
+                                download = download_info.value
+                                path = download.path()
+                                if path:
+                                    with open(path, "rb") as f:
+                                        downloaded.append(
+                                            (f.read(), download.suggested_filename or f"bonpreu_{clean_num}.pdf")
+                                        )
+                                    download_count += 1
+                                    self.report_progress(
+                                        f"✅ Factura {clean_num} descarregada correctament!",
+                                        current=i,
+                                        total=total_on_page,
+                                    )
+                            except PlaywrightTimeoutError:
+                                self.report_progress(
+                                    f"⏱️ Timeout descarregant factura {clean_num}. Saltant...",
+                                    current=i,
+                                    total=total_on_page,
+                                    status="warning",
+                                )
+                            except (PlaywrightError, TimeoutError, OSError) as err:
+                                self.logger.warning(f"No s'ha pogut descarregar el botó {i}: {err}")
+
+                        if limit is not None and download_count >= limit:
+                            break
+
+                        next_btn = page.query_selector("button:has-text('SEGÜENT'), button:has-text('SIGUIENTE')")
+                        if next_btn and not next_btn.is_disabled():
+                            self.report_progress("➡️ Passant a la següent pàgina de factures...")
+                            next_btn.click()
+                            page.wait_for_timeout(3000)
+                            page_num += 1
+                        else:
+                            has_more = False
 
                 except (PlaywrightError, PlaywrightTimeoutError, TimeoutError, OSError, RuntimeError) as page_err:
                     self.record_failure(f"Error de navegació a Bonpreu: {page_err}")
@@ -1232,6 +1320,8 @@ class BonpreuConnector(BaseConnector):
                 sender_filters=["bonpreu", "info@bonpreu.cat"],
                 days_back=1,
             )
+            # Ordenar els correus del més recent al més antic per agafar sempre l'últim codi generat
+            emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
             for em in emails:
                 subject_clean = em.subject.lower()
                 body_clean = em.body_text
@@ -1251,21 +1341,30 @@ class BonpreuConnector(BaseConnector):
         if not text:
             return None
 
-        # 1. Número de factura (ex: Factura núm. 2026E123456)
-        num_factura = extract_regex_first(text, r"(?:Factura\s*n[úu]m\.?|N[úu]mero\s*factura:?)\s*([A-Za-z0-9/_-]+)")
-        if not num_factura:
+        # 1. Número de factura (ex: Número de la factura:\nF26612441 o 2026E123456)
+        num_factura = extract_regex_first(
+            text, r"(?:N[úu]mero\s+(?:de\s+la\s+)?factura:?|Factura\s+n[úu]m\.?:?)\s*\n?\s*([A-Za-z0-9/_-]+)"
+        )
+        if not num_factura or num_factura.lower() == "ero":
+            num_factura = extract_regex_first(text, r"(F\d{7,12})")
+        if not num_factura or num_factura.lower() == "ero":
             num_factura = extract_regex_first(text, r"Factura\s+([0-9]{4}E[0-9]+)")
 
         # 2. Data d'emissió
         data_str = extract_regex_first(
-            text, r"(?:Data\s*emissi[óo]|Fecha\s*emisi[óo]n):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+            text, r"(?:Data\s*(?:d\x27)?emissi[óo]|Fecha\s*emisi[óo]n):?\s*\n?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
         )
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
 
         # 3. Import total
         total_eur = extract_float_value(
-            text, r"(?:Total\s*factura|Import\s*total|Total\s*a\s*pagar):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
+            text,
+            r"(?:Import\s+total\s+de\s+la\s+factura|Total\s*factura|Import\s*total|Total\s*a\s*pagar)[^\d\n]{0,30}\n?\s*(\d{1,4}(?:[.,]\d{1,2})?)\s*€",
         )
+        if total_eur is None:
+            total_eur = extract_float_value(
+                text, r"(?:Total\s*factura|Import\s*total|Total\s*a\s*pagar):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
+            )
         if total_eur is None:
             total_eur = parse_euro_amount(text)
 
@@ -1303,7 +1402,7 @@ class BonpreuConnector(BaseConnector):
             periode_inici=dt_inici,
             periode_fi=dt_fi,
             dies_facturats=(dt_fi - dt_inici).days if (dt_inici and dt_fi) else None,
-            import_total=float(total_eur),
+            import_total=total_eur,
             consum_kwh=consum_total,
             consum_kwh_punta=p1,
             consum_kwh_pla=p2,
@@ -1347,6 +1446,31 @@ class BonpreuConnector(BaseConnector):
                     "exists_in_nas": ja_al_nas,
                 }
             )
+
+        # Afegir també les factures que ja tenim al volum NAS (ex: descarregades del portal web)
+        nas_root = Path(settings.NAS_MOUNT_PATH) / self.tipus.value / self.name
+        existing_nums = {str(inv.get("numero", "")).lower() for inv in invoices}
+
+        if nas_root.exists():
+            for pdf_path in sorted(nas_root.glob("**/*.pdf"), reverse=True):
+                stem = pdf_path.stem
+                parts = stem.split(f"_{self.name}_")
+                num = parts[-1] if len(parts) > 1 else stem
+                if num.lower() not in existing_nums:
+                    existing_nums.add(num.lower())
+                    any_folder = pdf_path.parent.name
+                    invoices.append(
+                        {
+                            "id": f"nas_{stem}",
+                            "proveidor": self.name,
+                            "tipus": self.tipus.value,
+                            "data": f"{any_folder}-01-01",
+                            "numero": num,
+                            "import": 0.0,
+                            "subject": f"Factura {num} al NAS",
+                            "exists_in_nas": True,
+                        }
+                    )
         return invoices
 
 
@@ -1356,6 +1480,20 @@ FITXER: ./src/connectors/catgas.py
 import logging
 import re
 from datetime import date
+from pathlib import Path
+from typing import Any
+
+try:
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+
+    HAVE_PLAYWRIGHT = True
+except ImportError:
+    HAVE_PLAYWRIGHT = False
+    PlaywrightError = Exception  # type: ignore
+    PlaywrightTimeoutError = Exception  # type: ignore
+    sync_playwright = None  # type: ignore
 
 from src.config import settings
 from src.connectors.base import BaseConnector
@@ -1376,13 +1514,15 @@ logger = logging.getLogger("connector.catgas")
 class CatgasConnector(BaseConnector):
     """Connector per a Catgas Energia (Gas natural).
 
-    Extreu factures PDF rebudes per correu com a fitxer adjunt i en parseja consums i imports.
+    Extreu factures PDF tant des de la bústia de correu (IMAP) com des de l'Oficina Virtual web (Playwright).
     """
 
     name = "catgas"
     tipus = SubministreType.GAS
 
     EMAIL_SENDERS: tuple[str, ...] = ("catgas", "catgas.cat", "catgas.es", "facturacio@catgas.cat")
+    PORTAL_LOGIN_URL = "https://oficinavirtual.catgas.cat/acceso"
+    PORTAL_INVOICES_URL = "https://oficinavirtual.catgas.cat/factures"
 
     def is_enabled(self) -> bool:
         return settings.CATGAS_ENABLED
@@ -1399,55 +1539,287 @@ class CatgasConnector(BaseConnector):
             self.report_progress("Connector Catgas desactivat per configuració.", status="warning")
             return results
 
-        if source == "portal":
-            self.report_progress(
-                "⚠️ Catgas només rep factures per Correu IMAP (no disposa de scraper web). Cercant al correu...",
-                status="warning",
-            )
-
         days_back = 730 if mode == "all" else settings.DAYS_BACK
-        self.report_progress(f"📧 Connectant a bústia IMAP per Catgas (últims {days_back} dies)...")
-
-        emails = imap_client.fetch_recent_emails(
-            sender_filters=list(self.EMAIL_SENDERS),
-            days_back=days_back,
-        )
-        emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
-
-        pdf_attachments = [
-            (em, att) for em in emails for att in em.attachments if att.filename.lower().endswith(".pdf")
-        ]
         fetch_limit = 1 if mode == "latest" else (limit if limit is not None else (None if mode == "all" else 3))
-        if fetch_limit:
-            pdf_attachments = pdf_attachments[:fetch_limit]
 
-        total_pdfs = len(pdf_attachments)
-        self.report_progress(
-            f"📧 Trobats {len(emails)} correus i {total_pdfs} factures PDF adjuntes.",
-            current=0,
-            total=total_pdfs,
-        )
+        # 1. Extracció via Email (IMAP)
+        if source in ("auto", "email"):
+            self.report_progress(f"📧 Connectant a bústia IMAP per Catgas (últims {days_back} dies)...")
+            emails = imap_client.fetch_recent_emails(
+                sender_filters=list(self.EMAIL_SENDERS),
+                days_back=days_back,
+            )
+            emails.sort(key=lambda x: x.date.timestamp() if x.date else 0.0, reverse=True)
 
-        for idx, (em, att) in enumerate(pdf_attachments, start=1):
+            pdf_attachments = [
+                (em, att) for em in emails for att in em.attachments if att.filename.lower().endswith(".pdf")
+            ]
+            if fetch_limit:
+                pdf_attachments = pdf_attachments[:fetch_limit]
+
+            total_pdfs = len(pdf_attachments)
             self.report_progress(
-                f"📧 Processant factura Catgas {idx}/{total_pdfs}: {att.filename}",
-                current=idx,
+                f"📧 Trobats {len(emails)} correus i {total_pdfs} factures PDF adjuntes.",
+                current=0,
                 total=total_pdfs,
             )
-            metriques = self.extract_metrics_from_pdf(att.data)
-            if not metriques:
-                metriques = self._fallback_metrics(att.data, em.date.date() if em.date else date.today())
 
-            if metriques:
-                res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
-                results.append(res)
+            for idx, (em, att) in enumerate(pdf_attachments, start=1):
+                self.report_progress(
+                    f"📧 Processant factura Catgas {idx}/{total_pdfs}: {att.filename}",
+                    current=idx,
+                    total=total_pdfs,
+                )
+                metriques = self.extract_metrics_from_pdf(att.data)
+                if not metriques:
+                    metriques = self._fallback_metrics(att.data, em.date.date() if em.date else date.today())
 
-                if mode == "latest":
-                    return results
-                if limit and len(results) >= limit:
-                    return results
+                if metriques:
+                    res = self.save_and_ingest(att.data, metriques, origen="email_attachment")
+                    results.append(res)
+
+                    if mode == "latest":
+                        return results
+                    if limit and len(results) >= limit:
+                        return results
+
+            if source == "email":
+                return results
+            if results and mode != "all":
+                return results
+
+        # 2. Extracció via Oficina Virtual web (Playwright)
+        if source in ("auto", "portal"):
+            if not settings.CATGAS_USER or not settings.CATGAS_PASSWORD:
+                msg = "❌ Faltan credencials CATGAS_USER / CATGAS_PASSWORD al Secret per entrar a l'Oficina Virtual de Catgas."
+                self.report_progress(msg, status="error")
+                if source == "portal":
+                    raise RuntimeError(msg)
+                return results
+
+            self.report_progress("🌐 Iniciant descàrrega de factures des de l'Oficina Virtual de Catgas...")
+            portal_limit = 1 if mode == "latest" else limit
+            pdf_list = self.fetch_invoices_from_portal(limit=portal_limit)
+            total_dl = len(pdf_list)
+            for idx, (pdf_bytes, filename) in enumerate(pdf_list, start=1):
+                self.report_progress(
+                    f"💾 Analitzant i desant factura Catgas {filename} al NAS i InfluxDB...",
+                    current=idx,
+                    total=total_dl,
+                )
+                metriques = self.extract_metrics_from_pdf(pdf_bytes)
+                if not metriques:
+                    metriques = self._fallback_metrics(pdf_bytes, date.today())
+                if metriques:
+                    res = self.save_and_ingest(pdf_bytes, metriques, origen="web_portal_scraping")
+                    results.append(res)
+                    if mode == "latest":
+                        return results
 
         return results
+
+    def fetch_invoices_from_portal(self, limit: int | None = 3) -> list[tuple[bytes, str]]:
+        """Autenticació a l'Oficina Virtual de Catgas via Playwright i descàrrega de factures de Gas."""
+        downloaded: list[tuple[bytes, str]] = []
+        if self.is_in_cooldown():
+            return downloaded
+
+        if not HAVE_PLAYWRIGHT or sync_playwright is None:
+            self.report_progress("❌ Playwright no està instal·lat al contenidor.", status="error")
+            return downloaded
+
+        session_dir = Path(settings.NAS_MOUNT_PATH) / ".sessions"
+        session_file = session_dir / "catgas_session.json"
+        try:
+            session_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+        try:
+            self.report_progress("🌐 Iniciant navegador headless Chromium per a Catgas...")
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=settings.HEADLESS_BROWSER)
+                try:
+                    context_kwargs: dict[str, Any] = {"accept_downloads": True}
+                    if session_file.exists():
+                        self.report_progress("🌐 Carregant sessió prèvia de Catgas des del NAS...")
+                        context_kwargs["storage_state"] = str(session_file)
+
+                    context = browser.new_context(**context_kwargs)
+                    page = context.new_page()
+
+                    # 1. Obrir pàgina de factures
+                    self.report_progress(f"🌐 Obrint Oficina Virtual Catgas ({self.PORTAL_INVOICES_URL})...")
+                    page.goto(
+                        self.PORTAL_INVOICES_URL,
+                        wait_until="domcontentloaded",
+                        timeout=settings.SCRAPER_TIMEOUT_MS,
+                    )
+                    page.wait_for_timeout(2000)
+
+                    # Acceptar banner de cookies si apareix
+                    try:
+                        cookie_btn = page.query_selector("button:has-text('ACEPTAR TODAS')")
+                        if cookie_btn and cookie_btn.is_visible():
+                            self.report_progress("🍪 Acceptant cookies de Catgas...")
+                            cookie_btn.click()
+                            page.wait_for_timeout(500)
+                    except PlaywrightError:
+                        pass
+
+                    # 2. Comprovar si cal fer login
+                    needs_login = "acceso" in page.url.lower() or page.query_selector("input#username") is not None
+
+                    if needs_login:
+                        self.report_progress(f"🔑 Sessió no activa. Accedint a login ({self.PORTAL_LOGIN_URL})...")
+                        page.goto(
+                            self.PORTAL_LOGIN_URL,
+                            wait_until="domcontentloaded",
+                            timeout=settings.SCRAPER_TIMEOUT_MS,
+                        )
+                        page.wait_for_timeout(2000)
+
+                        try:
+                            cookie_btn = page.query_selector("button:has-text('ACEPTAR TODAS')")
+                            if cookie_btn and cookie_btn.is_visible():
+                                cookie_btn.click()
+                                page.wait_for_timeout(500)
+                        except PlaywrightError:
+                            pass
+
+                        user_input = page.wait_for_selector("input#username", timeout=15000)
+                        pass_input = page.wait_for_selector("input#password-field", timeout=15000)
+
+                        if not user_input or not pass_input:
+                            msg = f"No s'ha trobat el formulari de login a {page.url}"
+                            self.record_failure(msg)
+                            self.report_progress(f"❌ {msg}", status="error")
+                            return downloaded
+
+                        self.report_progress(f"🔑 Introduint credencials de '{settings.CATGAS_USER}'...")
+                        user_input.fill(settings.CATGAS_USER or "")
+                        pass_input.fill(settings.CATGAS_PASSWORD or "")
+                        page.click("button[type='submit']:has-text('ACCEDER')")
+                        page.wait_for_load_state("domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS)
+                        page.wait_for_timeout(4000)
+
+                        if "acceso" in page.url.lower() and page.query_selector("input#password-field"):
+                            msg = "Login rebutjat a l'Oficina Virtual de Catgas (revisa NIF/contrasenya)."
+                            self.record_failure(msg)
+                            self.report_progress(f"❌ {msg}", status="error")
+                            return downloaded
+
+                    # 3. Desar sessió vàlida al NAS
+                    try:
+                        context.storage_state(path=str(session_file))
+                        self.logger.info("✅ Sessió de Catgas desada al NAS!")
+                    except (OSError, RuntimeError):
+                        pass
+
+                    # 4. Assegurar que som a la pestanya GAS
+                    self.report_progress("🔥 Seleccionant pestanya de factures de GAS...")
+                    gas_tab = page.wait_for_selector(
+                        "button:has-text('GAS'), [role='tab']:has-text('GAS')", timeout=15000
+                    )
+                    if gas_tab:
+                        gas_tab.click()
+                        page.wait_for_timeout(2500)
+
+                    # 5. Cercar files de la taula de gas
+                    from src.storage import storage
+
+                    rows = page.query_selector_all("tr.MuiTableRow-root, tr")
+                    candidate_rows = []
+                    for r in rows:
+                        btn = r.query_selector("button:has-text('DESCARREGAR'), button:has-text('DESCARGAR')")
+                        if btn:
+                            candidate_rows.append((r, btn))
+
+                    total_found = len(candidate_rows)
+                    if total_found == 0:
+                        self.report_progress(
+                            "⚠️ Connectat a l'Oficina Virtual de Catgas, però s'han trobat 0 botons de descàrrega de gas.",
+                            status="warning",
+                        )
+                        return downloaded
+
+                    self.report_progress(
+                        f"🌐 Trobades {total_found} factures de gas al portal. Comprovant quines falten al NAS...",
+                        current=0,
+                        total=total_found,
+                    )
+
+                    download_count = 0
+                    for i, (r, btn) in enumerate(candidate_rows, start=1):
+                        tds = r.query_selector_all("td")
+                        num = tds[0].inner_text().strip() if tds else ""
+                        data_str = tds[1].inner_text().strip() if len(tds) > 1 else ""
+                        clean_num = re.sub(r"[^A-Za-z0-9_-]", "", num)
+                        any_clean = re.sub(r"[^0-9]", "", data_str.split("/")[-1]) if "/" in data_str else "2026"
+                        any_str = any_clean if len(any_clean) == 4 else "2026"
+                        dest_dir = storage.get_destination_dir(self.tipus.value, self.name, any_str)
+                        ja_al_nas = any(clean_num in f.name for f in dest_dir.glob("*.pdf")) if clean_num else False
+
+                        if ja_al_nas:
+                            self.report_progress(
+                                f"⏭️ Factura Catgas {clean_num} ({data_str}) ja existeix al NAS. Ometent.",
+                                current=i,
+                                total=total_found,
+                            )
+                            continue
+
+                        if limit is not None and download_count >= limit:
+                            break
+
+                        self.report_progress(
+                            f"⬇️ Descarregant factura de gas que falta: {clean_num} ({data_str})...",
+                            current=i,
+                            total=total_found,
+                        )
+                        try:
+                            with page.expect_download(timeout=20000) as download_info:
+                                page.evaluate("el => el.click()", btn)
+                            download = download_info.value
+                            path = download.path()
+                            if path:
+                                with open(path, "rb") as f:
+                                    downloaded.append(
+                                        (f.read(), download.suggested_filename or f"catgas_{clean_num}.pdf")
+                                    )
+                                download_count += 1
+                                self.report_progress(
+                                    f"✅ Factura {clean_num} descarregada correctament!",
+                                    current=i,
+                                    total=total_found,
+                                )
+                        except PlaywrightTimeoutError:
+                            self.report_progress(
+                                f"⏱️ Timeout (20s) esperant la descàrrega de la factura {clean_num}. Saltant...",
+                                current=i,
+                                total=total_found,
+                                status="warning",
+                            )
+                        except (PlaywrightError, TimeoutError, OSError) as err:
+                            self.logger.warning(f"Error en factura Catgas {clean_num}: {err}")
+
+                except PlaywrightTimeoutError as t_err:
+                    msg = f"⏱️ Timeout carregant l'Oficina Virtual de Catgas: {t_err}"
+                    self.record_failure(msg)
+                    self.report_progress(msg, status="error")
+                except (PlaywrightError, TimeoutError, OSError, RuntimeError) as page_err:
+                    self.record_failure(f"Error de navegació a Catgas: {page_err}")
+                    self.report_progress(f"❌ Error navegant a Catgas: {page_err}", status="error")
+                finally:
+                    browser.close()
+
+        except (PlaywrightError, TimeoutError, OSError, RuntimeError) as e:
+            self.record_failure(f"Error de Playwright a Catgas: {e}")
+            self.report_progress(f"❌ Error crític de Playwright: {e}", status="error")
+
+        if downloaded:
+            self.record_success()
+
+        return downloaded
 
     def fetch_available_invoices(self, imap_client: ImapMailboxClient) -> list[dict]:
         """Llista les factures de Catgas trobades a la bústia i el seu estat al NAS."""
@@ -1496,6 +1868,31 @@ class CatgasConnector(BaseConnector):
                         "exists_in_nas": ja_al_nas,
                     }
                 )
+
+        # Afegir també les factures que ja tenim al volum NAS (ex: descarregades del portal web)
+        nas_root = Path(settings.NAS_MOUNT_PATH) / self.tipus.value / self.name
+        existing_nums = {str(inv.get("numero", "")).lower() for inv in invoices}
+
+        if nas_root.exists():
+            for pdf_path in sorted(nas_root.glob("**/*.pdf"), reverse=True):
+                stem = pdf_path.stem
+                parts = stem.split(f"_{self.name}_")
+                num = parts[-1] if len(parts) > 1 else stem
+                if num.lower() not in existing_nums:
+                    existing_nums.add(num.lower())
+                    any_folder = pdf_path.parent.name
+                    invoices.append(
+                        {
+                            "id": f"nas_{stem}",
+                            "proveidor": self.name,
+                            "tipus": self.tipus.value,
+                            "data": f"{any_folder}-01-01",
+                            "numero": num,
+                            "import": 0.0,
+                            "subject": f"Factura {num} al NAS",
+                            "exists_in_nas": True,
+                        }
+                    )
         return invoices
 
     def extract_metrics_from_pdf(self, pdf_bytes: bytes) -> FacturaMetriques | None:
@@ -1553,7 +1950,7 @@ class CatgasConnector(BaseConnector):
             periode_inici=dt_inici,
             periode_fi=dt_fi,
             dies_facturats=(dt_fi - dt_inici).days if (dt_inici and dt_fi) else None,
-            import_total=float(total_eur),
+            import_total=total_eur,
             consum_kwh=consum_kwh,
             consum_m3=consum_m3,
             cups_o_referencia=cups,
@@ -1989,6 +2386,31 @@ class DigiConnector(BaseConnector):
                         "exists_in_nas": ja_al_nas,
                     }
                 )
+
+        # Afegir també les factures que ja tenim al volum NAS (descarregades del portal web)
+        nas_root = Path(settings.NAS_MOUNT_PATH) / self.tipus.value / self.name
+        existing_nums = {str(inv.get("numero", "")).lower() for inv in invoices}
+
+        if nas_root.exists():
+            for pdf_path in sorted(nas_root.glob("**/*.pdf"), reverse=True):
+                stem = pdf_path.stem
+                parts = stem.split(f"_{self.name}_")
+                num = parts[-1] if len(parts) > 1 else stem
+                if num.lower() not in existing_nums:
+                    existing_nums.add(num.lower())
+                    any_folder = pdf_path.parent.name
+                    invoices.append(
+                        {
+                            "id": f"nas_{stem}",
+                            "proveidor": self.name,
+                            "tipus": self.tipus.value,
+                            "data": f"{any_folder}-01-01",
+                            "numero": num,
+                            "import": 0.0,
+                            "subject": f"Factura {num} al NAS",
+                            "exists_in_nas": True,
+                        }
+                    )
         return invoices
 
 
@@ -2109,7 +2531,7 @@ class VeoliaConnector(BaseConnector):
                     raise RuntimeError(msg)
                 return results
 
-            pdf_list = self.fetch_invoices_from_portal(limit=fetch_limit)
+            pdf_list = self.fetch_invoices_from_portal(limit=fetch_limit, imap_client=imap_client)
             total_dl = len(pdf_list)
             for idx, (pdf_bytes, filename) in enumerate(pdf_list, start=1):
                 self.report_progress(
@@ -2124,8 +2546,13 @@ class VeoliaConnector(BaseConnector):
 
         return results
 
-    def fetch_invoices_from_portal(self, limit: int | None = 3) -> list[tuple[bytes, str]]:
-        """Autenticació al portal d'Agbar/Veolia via Playwright amb traçabilitat pas a pas."""
+    def fetch_invoices_from_portal(
+        self,
+        limit: int | None = 3,
+        otp_code: str | None = None,
+        imap_client: ImapMailboxClient | None = None,
+    ) -> list[tuple[bytes, str]]:
+        """Autenticació al portal d'Agbar/Veolia via Playwright, suport 2FA i descàrrega de factures."""
         downloaded: list[tuple[bytes, str]] = []
         if self.is_in_cooldown():
             return downloaded
@@ -2154,7 +2581,7 @@ class VeoliaConnector(BaseConnector):
                     context = browser.new_context(**context_kwargs)
                     page = context.new_page()
 
-                    # 1. Obrir portal (domcontentloaded per evitar bloqueig per scripts d'analítica)
+                    # 1. Obrir llistat de factures
                     self.report_progress(f"🌐 Obrint portal Veolia ({self.PORTAL_INVOICES_URL})...")
                     page.goto(
                         self.PORTAL_INVOICES_URL,
@@ -2175,27 +2602,44 @@ class VeoliaConnector(BaseConnector):
                     except PlaywrightError:
                         pass
 
-                    # 2. Comprovar si cal fer login
-                    login_input = page.query_selector(
-                        "input#login, input[name*='login'], input[type='email'], input[name='username']"
+                    # 2. Comprovar si estem autenticats o si cal fer login
+                    is_authenticated = (
+                        "/group/sgab/" in page.url.lower()
+                        and "login" not in page.url.lower()
+                        and page.query_selector(
+                            "a[data-testid='icon-perfil'], #profile-dialog, a[data-test-id='verDetalleFactura']"
+                        )
+                        is not None
                     )
-                    pass_input = page.query_selector("input#password, input[name*='password'], input[type='password']")
 
-                    if "login" in page.url.lower() or (login_input and pass_input):
-                        self.report_progress(f"🔑 Sessió no activa. Autenticant usuari '{settings.VEOLIA_USER}'...")
-                        if not login_input or not pass_input:
-                            page.goto(
-                                self.PORTAL_LOGIN_URL,
-                                wait_until="domcontentloaded",
-                                timeout=settings.SCRAPER_TIMEOUT_MS,
+                    if not is_authenticated:
+                        self.report_progress(f"🔑 Sessió no activa. Accedint a login ({self.PORTAL_LOGIN_URL})...")
+                        page.goto(
+                            self.PORTAL_LOGIN_URL,
+                            wait_until="domcontentloaded",
+                            timeout=settings.SCRAPER_TIMEOUT_MS,
+                        )
+                        page.wait_for_timeout(2000)
+
+                        # Re-acceptar cookies al login si cal
+                        try:
+                            cookie_btn = page.query_selector(
+                                "#onetrust-accept-btn-handler, button:has-text('Acceptar'), button:has-text('Aceptar')"
                             )
-                            page.wait_for_timeout(2000)
-                            login_input = page.query_selector(
-                                "input#login, input[name*='login'], input[type='email'], input[name='username']"
-                            )
-                            pass_input = page.query_selector(
-                                "input#password, input[name*='password'], input[type='password']"
-                            )
+                            if cookie_btn and cookie_btn.is_visible():
+                                cookie_btn.click()
+                                page.wait_for_timeout(1000)
+                        except PlaywrightError:
+                            pass
+
+                        login_input = page.wait_for_selector(
+                            "input#login, input[name='_CustomLoginPortlet_login']",
+                            timeout=15000,
+                        )
+                        pass_input = page.wait_for_selector(
+                            "input#password, input[name='_CustomLoginPortlet_password']",
+                            timeout=15000,
+                        )
 
                         if not login_input or not pass_input:
                             msg = f"No s'ha trobat el formulari de login a {page.url}"
@@ -2203,33 +2647,70 @@ class VeoliaConnector(BaseConnector):
                             self.report_progress(f"❌ {msg}", status="error")
                             return downloaded
 
+                        self.report_progress(f"🔑 Introduint credencials de '{settings.VEOLIA_USER}'...")
                         login_input.fill(settings.VEOLIA_USER or "")
                         pass_input.fill(settings.VEOLIA_PASSWORD or "")
-                        submit_btn = page.query_selector(
-                            "button#btn-submit, button[type='submit'], input[type='submit']"
-                        )
-                        if submit_btn:
-                            submit_btn.click()
-                        else:
-                            pass_input.press("Enter")
 
-                        page.wait_for_load_state("domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS)
-                        page.wait_for_timeout(3500)
+                        # Activar el botó Acceder disabled
+                        page.dispatch_event("input#login", "input")
+                        page.dispatch_event("input#login", "change")
+                        page.dispatch_event("input#password", "input")
+                        page.dispatch_event("input#password", "change")
+                        page.wait_for_timeout(500)
 
-                        if "login" in page.url.lower() and page.query_selector("input[type='password']"):
-                            msg = "Login rebutjat a Veolia (revisa usuari/contrasenya o bloqueig captcha)."
+                        submit_btn = page.query_selector("button#btn-submit")
+                        with page.expect_navigation(wait_until="domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS):
+                            if submit_btn and not submit_btn.is_disabled():
+                                submit_btn.click()
+                            else:
+                                page.evaluate(
+                                    "() => { const f = document.querySelector('#loginForm'); if (f) f.submit(); }"
+                                )
+
+                        page.wait_for_timeout(2500)
+
+                        # Detecció de 2FA (6 dígits)
+                        two_fa_container = page.query_selector("#two-factor-code-inputs, #two-factor-code-1")
+                        if two_fa_container:
+                            self.report_progress("🔐 Veolia sol·licita codi 2FA de 6 dígits...", status="warning")
+                            code_to_use = otp_code
+                            if not code_to_use and imap_client and imap_client.is_configured():
+                                self.report_progress("📧 Cercant codi 2FA a la bústia de correu...")
+                                code_to_use = self._fetch_otp_code_from_email(imap_client, timeout_seconds=75)
+
+                            if code_to_use and len(code_to_use) >= 6:
+                                self.report_progress(f"🔐 Introduint codi 2FA: {code_to_use}...")
+                                for digit_idx, char in enumerate(code_to_use[:6], start=1):
+                                    digit_input = page.query_selector(f"#two-factor-code-{digit_idx}")
+                                    if digit_input:
+                                        digit_input.fill(char)
+                                verify_btn = page.query_selector("button#verify-code")
+                                if verify_btn:
+                                    verify_btn.click()
+                                page.wait_for_load_state("domcontentloaded", timeout=settings.SCRAPER_TIMEOUT_MS)
+                                page.wait_for_timeout(3000)
+                            else:
+                                msg = "🔐 Veolia requereix codi 2FA enviat per correu. Introdueix-lo o torna a provar."
+                                self.record_failure(msg)
+                                self.report_progress(f"⚠️ {msg}", status="warning")
+                                return downloaded
+
+                        # Verificar si el login ha fallat
+                        if "login" in page.url.lower() and page.query_selector("input#password"):
+                            msg = "Login rebutjat a Veolia (revisa usuari/contrasenya o possible captcha)."
                             self.record_failure(msg)
                             self.report_progress(f"❌ {msg}", status="error")
                             return downloaded
 
-                    # 3. Desar sessió vàlida
+                    # 3. Desar sessió vàlida al NAS
                     try:
                         context.storage_state(path=str(session_file))
+                        self.logger.info("✅ Sessió de Veolia desada al NAS!")
                     except (OSError, RuntimeError):
                         pass
 
-                    # 4. Anar a l'apartat de factures si cal
-                    if "mis-facturas" not in page.url.lower() and "factur" not in page.url.lower():
+                    # 4. Navegar al llistat de factures si no hi som
+                    if "mis-facturas" not in page.url.lower():
                         self.report_progress("🌐 Accedint al llistat de factures de Veolia...")
                         page.goto(
                             self.PORTAL_INVOICES_URL,
@@ -2238,17 +2719,23 @@ class VeoliaConnector(BaseConnector):
                         )
                         page.wait_for_timeout(3000)
 
-                    # 5. Cercar enllaços de descàrrega de PDF (segons DOM real)
-                    download_buttons = page.query_selector_all(
-                        "#descargar-factura-digital a, a:has-text('Descarrega'), a:has-text('Descargar'), "
-                        "a[href*='descargarFacturaPdf'], a[onclick*='descargarFacturaPdf'], a[href*='.pdf'], button:has-text('PDF')"
+                    # 5. Cerca els enllaços de detall de les factures (segons DOM real d'Agbar/Veolia)
+                    detail_links = page.query_selector_all(
+                        "a[data-test-id='verDetalleFactura'], a[href*='/misfacturas/view/']"
                     )
-                    total_found = len(download_buttons)
+
+                    invoice_urls: list[str] = []
+                    for a in detail_links:
+                        href = a.get_attribute("href")
+                        if href and "/misfacturas/view/" in href and href != "#" and href not in invoice_urls:
+                            invoice_urls.append(href)
+
+                    total_found = len(invoice_urls)
                     max_dl = min(limit, total_found) if limit is not None else total_found
 
                     if total_found == 0:
                         self.report_progress(
-                            f"⚠️ Connectat a {page.url}, però s'han trobat 0 botons de factura descarregables.",
+                            f"⚠️ Connectat a {page.url}, però s'han trobat 0 enllaços de factura.",
                             status="warning",
                         )
                         return downloaded
@@ -2259,22 +2746,51 @@ class VeoliaConnector(BaseConnector):
                         total=max_dl,
                     )
 
-                    for i, btn in enumerate(download_buttons[:max_dl], start=1):
+                    nas_root = Path(settings.NAS_MOUNT_PATH) / self.tipus.value / self.name
+                    existing_files = list(nas_root.glob("**/*.pdf")) if nas_root.exists() else []
+
+                    for i, inv_url in enumerate(invoice_urls[:max_dl], start=1):
+                        inv_num_hint = inv_url.split("/")[-3] if len(inv_url.split("/")) >= 3 else f"factura_{i}"
+                        if any(inv_num_hint in f.name for f in existing_files):
+                            self.report_progress(
+                                f"⏭️ Factura Veolia {inv_num_hint} ja és al NAS. Ometent ({i}/{max_dl}).",
+                                current=i,
+                                total=max_dl,
+                            )
+                            continue
+
                         self.report_progress(
-                            f"⬇️ Descarregant factura {i} de {max_dl} des del portal Veolia...",
+                            f"⬇️ Accedint a factura {i} de {max_dl} ({inv_num_hint})...",
                             current=i,
                             total=max_dl,
                         )
                         try:
+                            page.goto(inv_url, wait_until="domcontentloaded", timeout=20000)
+                            page.wait_for_timeout(1500)
+
+                            # A la pàgina de detall, el botó oficial de descàrrega és exclusivament #descargar-factura-digital a o a[onclick*='descargarFacturaPdf']
+                            dl_btn = page.query_selector(
+                                "#descargar-factura-digital a, a[onclick*='descargarFacturaPdf']"
+                            )
                             with page.expect_download(timeout=20000) as download_info:
-                                btn.click()
+                                if dl_btn:
+                                    page.evaluate("el => el.click()", dl_btn)
+                                else:
+                                    page.evaluate(
+                                        "() => { if (typeof ovMisFacturas !== 'undefined' && ovMisFacturas.url) location.href = ovMisFacturas.url.urlDescargarFacturaPdf; }"
+                                    )
                             download = download_info.value
                             path = download.path()
                             if path:
                                 with open(path, "rb") as f:
                                     downloaded.append(
-                                        (f.read(), download.suggested_filename or f"veolia_factura_{i}.pdf")
+                                        (f.read(), download.suggested_filename or f"veolia_{inv_num_hint}.pdf")
                                     )
+                                self.report_progress(
+                                    f"✅ Factura {i}/{max_dl} descarregada correctament!",
+                                    current=i,
+                                    total=max_dl,
+                                )
                         except PlaywrightTimeoutError:
                             self.report_progress(
                                 f"⏱️ Timeout (20s) esperant la descàrrega de la factura {i}/{max_dl}. Saltant a la següent...",
@@ -2303,6 +2819,38 @@ class VeoliaConnector(BaseConnector):
             self.record_success()
 
         return downloaded
+
+    def _fetch_otp_code_from_email(
+        self,
+        imap_client: ImapMailboxClient,
+        timeout_seconds: int = 75,
+    ) -> str | None:
+        """Cerca el codi 2FA de 6 dígits enviat per Veolia a la bústia IMAP."""
+        import time
+
+        start_time = time.time()
+        self.logger.info(f"Esperant arribada del correu 2FA de Veolia (fins a {timeout_seconds}s)...")
+        while time.time() - start_time < timeout_seconds:
+            emails = imap_client.fetch_recent_emails(
+                sender_filters=list(self.EMAIL_SENDERS),
+                days_back=1,
+            )
+            for em in emails:
+                subject_clean = em.subject.lower()
+                body_clean = em.body_text
+                if (
+                    "código" in subject_clean
+                    or "codi" in subject_clean
+                    or "autentic" in subject_clean
+                    or "identitat" in subject_clean
+                ):
+                    match = re.search(r"\b(\d{6})\b", body_clean)
+                    if match:
+                        code = match.group(1)
+                        self.logger.info(f"✅ Codi 2FA de Veolia capturat del correu: {code}")
+                        return code
+            time.sleep(3)
+        return None
 
     def fetch_available_invoices(self, imap_client: ImapMailboxClient) -> list[dict]:
         """Llista les factures de Veolia trobades a la bústia i el seu estat al NAS."""
@@ -2351,6 +2899,31 @@ class VeoliaConnector(BaseConnector):
                         "exists_in_nas": ja_al_nas,
                     }
                 )
+
+        # Afegir també les factures que ja tenim al volum NAS (descarregades del portal web)
+        nas_root = Path(settings.NAS_MOUNT_PATH) / self.tipus.value / self.name
+        existing_nums = {str(inv.get("numero", "")).lower() for inv in invoices}
+
+        if nas_root.exists():
+            for pdf_path in sorted(nas_root.glob("**/*.pdf"), reverse=True):
+                stem = pdf_path.stem
+                parts = stem.split(f"_{self.name}_")
+                num = parts[-1] if len(parts) > 1 else stem
+                if num.lower() not in existing_nums:
+                    existing_nums.add(num.lower())
+                    any_folder = pdf_path.parent.name
+                    invoices.append(
+                        {
+                            "id": f"nas_{stem}",
+                            "proveidor": self.name,
+                            "tipus": self.tipus.value,
+                            "data": f"{any_folder}-01-01",
+                            "numero": num,
+                            "import": 0.0,
+                            "subject": f"Factura {num} al NAS",
+                            "exists_in_nas": True,
+                        }
+                    )
         return invoices
 
     def extract_metrics_from_pdf(self, pdf_bytes: bytes) -> FacturaMetriques | None:
@@ -2359,21 +2932,55 @@ class VeoliaConnector(BaseConnector):
         if not text:
             return None
 
-        # 1. Número de factura
-        # Exemples: "Número factura: 2026/123456" o "Factura núm. B12345678"
-        num_factura = extract_regex_first(text, r"(?:Factura\s*n[úu]m\.?|N[úu]mero\s*factura:?)\s*([A-Za-z0-9/_-]+)")
-        if not num_factura:
-            num_factura = extract_regex_first(text, r"Factura\s+([A-Za-z0-9/_-]{6,20})")
+        # 1. Detecció de Període Trimestral (Veolia / Agbar facturem per trimestres, ex: 2026/3 o 3 / 2026)
+        quarter: int | None = None
+        quarter_year: int | None = None
 
-        # 2. Data d'emissió
-        data_str = extract_regex_first(
-            text, r"(?:Data\s*d'emissi[óo]|Fecha\s*emisi[óo]n):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+        quarter_match = re.search(
+            r"(?:Per[íi]ode(?:[\s\w]*?):?[\s]*)(?:(\d{4})\s*[/_-]\s*([1-4])|([1-4])\s*[/_-]\s*(\d{4})|([1-4])[ººrrtT]?\s*(?:trimestre|trim\.?)\s*(?:de(?:l)?)?\s*(\d{4}))",
+            text,
+            re.IGNORECASE,
         )
+        if quarter_match:
+            g1, g2, g3, g4, g5, g6 = quarter_match.groups()
+            if g1 and g2:
+                quarter_year, quarter = int(g1), int(g2)
+            elif g3 and g4:
+                quarter, quarter_year = int(g3), int(g4)
+            elif g5 and g6:
+                quarter, quarter_year = int(g5), int(g6)
+        else:
+            # Cerca genèrica de patró trimestre/any (ex: "3 / 2026" o "2026/3")
+            simple_q = re.search(r"\b([1-4])\s*/\s*(\d{4})\b|\b(\d{4})\s*/\s*([1-4])\b", text)
+            if simple_q:
+                q_a, y_a, y_b, q_b = simple_q.groups()
+                if q_a and y_a and 2000 <= int(y_a) <= 2100:
+                    quarter, quarter_year = int(q_a), int(y_a)
+                elif y_b and q_b and 2000 <= int(y_b) <= 2100:
+                    quarter_year, quarter = int(y_b), int(q_b)
+
+        # 2. Número de factura
+        # Exemples: "Número factura: 2026/123456", "Factura núm. B12345678", "Núm. 22272026A100094695"
+        num_factura = extract_regex_first(
+            text,
+            r"(?:Factura\s*(?:n[úu]m\.?|n[ºº])|N[úu]mero\s*(?:de\s*)?factura|N[úu]m\.?\s*(?:de\s*)?factura|N[úu]m\.?)\s*:?\s*([A-Za-z0-9/_-]{6,30})",
+        )
+        if not num_factura:
+            num_factura = extract_regex_first(text, r"Factura\s+([A-Za-z0-9/_-]{6,25})")
+
+        # 3. Data d'emissió
+        data_str = extract_regex_first(
+            text,
+            r"(?:Data\s*(?:d'emissi[óo]|emisi[óo]n|factura|de\s*la\s*factura)?|Fecha\s*(?:de\s*)?emisi[óo]n?):?\s*(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})",
+        )
+        if not data_str:
+            data_str = extract_regex_first(text, r"(?:Data|Fecha):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})")
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
 
-        # 3. Import total
+        # 4. Import total
         total_eur = extract_float_value(
-            text, r"(?:Total\s*factura|Import\s*total|Total\s*a\s*pagar):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
+            text,
+            r"(?:Total\s*(?:factura|a\s*pagar|rebut)?|Import\s*total|Total|Importe\s*total):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?",
         )
         if total_eur is None:
             total_eur = parse_euro_amount(text)
@@ -2382,34 +2989,70 @@ class VeoliaConnector(BaseConnector):
         if total_eur is None:
             return None
 
-        # 4. Consum d'aigua en m3
-        # Exemples: "Consum facturat: 12 m3" o "Consum del període: 14 m³"
+        # 5. Consum d'aigua en m3
+        # Exemples: "Consum facturat: 12 m3", "Consum del període: 14 m³", "Consum: 12 m3"
         consum_m3 = extract_float_value(
-            text, r"(?:Consum\s*facturat|Consumo\s*facturado|Consum\s*per[íi]ode):?\s*(\d+(?:[.,]\d{1,2})?)\s*m[3³]"
+            text,
+            r"(?:Consum\s*(?:facturat|del\s*per[íi]ode|total)?|Consumo\s*(?:facturado)?):?\s*(\d+(?:[.,]\d{1,2})?)\s*m[3³]",
         )
         if consum_m3 is None:
             consum_m3 = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*m[3³]")
 
-        # 5. Dates del període
+        # 6. Dates del període
         dt_inici, dt_fi = extract_date_range(
             text,
             r"(?:Per[íi]ode\s*facturat|Per[íi]odo):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:a|fins\s*a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         )
 
-        # 6. Referència o contracte
+        # Si no hem trobat rang de dates explícit per regex, però tenim el trimestre (ex: 2026/3):
+        if (not dt_inici or not dt_fi) and quarter and quarter_year:
+            quarter_ranges = {
+                1: (date(quarter_year, 1, 1), date(quarter_year, 3, 31)),
+                2: (date(quarter_year, 4, 1), date(quarter_year, 6, 30)),
+                3: (date(quarter_year, 7, 1), date(quarter_year, 9, 30)),
+                4: (date(quarter_year, 10, 1), date(quarter_year, 12, 31)),
+            }
+            if quarter in quarter_ranges:
+                dt_inici, dt_fi = quarter_ranges[quarter]
+
+        # Si no tenim data d'emissió però tenim trimestre, establim la fi del trimestre com a referència
+        if not data_emissio:
+            if dt_fi:
+                data_emissio = dt_fi
+            else:
+                data_emissio = date.today()
+
+        # 7. Referència o contracte
         contracte = extract_regex_first(text, r"(?:Contracte|Contrato|P[òo]lissa):?\s*([0-9A-Za-z/_-]+)")
+
+        dies = (dt_fi - dt_inici).days + 1 if (dt_inici and dt_fi) else None
+
+        tags_extra: dict[str, str] = {}
+        fields_extra: dict[str, float] = {}
+        if quarter:
+            tags_extra["trimestre"] = f"T{quarter}"
+            if quarter_year:
+                tags_extra["periode_trimestral"] = f"{quarter_year}/T{quarter}"
+            fields_extra["trimestre_num"] = float(quarter)
 
         return FacturaMetriques(
             proveidor=self.name,
             tipus=self.tipus,
-            numero_factura=num_factura or f"VEOLIA-{date.today().isoformat()}",
-            data_emissio=data_emissio or date.today(),
+            numero_factura=num_factura
+            or (
+                f"VEOLIA-{quarter_year}T{quarter}"
+                if (quarter and quarter_year)
+                else f"VEOLIA-{date.today().isoformat()}"
+            ),
+            data_emissio=data_emissio,
             periode_inici=dt_inici,
             periode_fi=dt_fi,
-            dies_facturats=(dt_fi - dt_inici).days if (dt_inici and dt_fi) else None,
+            dies_facturats=dies,
             import_total=float(total_eur),
             consum_m3=consum_m3,
             cups_o_referencia=contracte,
+            tags_extra=tags_extra,
+            fields_extra=fields_extra,
         )
 
     def _fallback_metrics(self, pdf_bytes: bytes, fallback_date: date) -> FacturaMetriques | None:
@@ -2780,6 +3423,17 @@ class InfluxMetricsWriter:
         for k, num in metriques.fields_extra.items():
             point.field(k, float(num))
 
+        # Càlcul automàtic de ràtios unitaris per a Grafana
+        try:
+            if metriques.dies_facturats and metriques.dies_facturats > 0:
+                point.field("cost_diari_eur", round(float(metriques.import_total) / int(metriques.dies_facturats), 4))
+            if metriques.consum_kwh and metriques.consum_kwh > 0:
+                point.field("preu_kwh_real", round(float(metriques.import_total) / float(metriques.consum_kwh), 4))
+            if metriques.consum_m3 and metriques.consum_m3 > 0:
+                point.field("preu_m3_real", round(float(metriques.import_total) / float(metriques.consum_m3), 4))
+        except (ValueError, TypeError, ZeroDivisionError) as err:
+            logger.debug(f"Error calculant ràtios unitaris: {err}")
+
         try:
             with InfluxDBClient(url=self.url, token=self.token, org=self.org) as client:
                 write_api = client.write_api(write_options=SYNCHRONOUS)
@@ -3134,34 +3788,55 @@ def parse_euro_amount(text: str) -> float | None:
 
 
 def parse_date_catalan_spanish(date_str: str) -> date | None:
-    """Intenta parsejar dates típiques en català o castellà (ex: 15/09/2026, 15 d'octubre de 2026)."""
+    """Intenta parsejar dates típiques en català o castellà (ex: 15/09/2026, 15 d'octubre de 2026, 09 d'oct. 2026)."""
     months_map = {
         "gener": "01",
         "enero": "01",
+        "gen": "01",
+        "ene": "01",
         "febrer": "02",
         "febrero": "02",
+        "feb": "02",
         "març": "03",
         "marzo": "03",
+        "mar": "03",
         "abril": "04",
+        "abr": "04",
         "maig": "05",
         "mayo": "05",
+        "mai": "05",
+        "may": "05",
         "juny": "06",
         "junio": "06",
+        "jun": "06",
         "juliol": "07",
         "julio": "07",
+        "jul": "07",
         "agost": "08",
         "agosto": "08",
+        "ago": "08",
         "setembre": "09",
         "septiembre": "09",
+        "set": "09",
+        "sep": "09",
         "octubre": "10",
+        "oct": "10",
         "novembre": "11",
         "noviembre": "11",
+        "nov": "11",
         "desembre": "12",
         "diciembre": "12",
+        "des": "12",
+        "dic": "12",
     }
-    clean = date_str.lower()
+    clean = date_str.lower().strip()
+    # Netejar connectors en català/castellà com "d'", "d’", "de ", "del "
+    clean = re.sub(r"\bd\s*['’]\s*", "", clean)
+    clean = re.sub(r"\bde\s+", "", clean)
+    clean = re.sub(r"\bdel\s+", "", clean)
+
     for cat_es, num in months_map.items():
-        clean = re.sub(rf"\b{cat_es}\b", num, clean)
+        clean = re.sub(rf"\b{cat_es}\.?\b", num, clean)
     clean = re.sub(r"[^\w\s/.-]", " ", clean)
 
     try:
@@ -3491,6 +4166,10 @@ MESOS_CATALANS = {
     "10": "Oct",
     "11": "Nov",
     "12": "Des",
+    "T1": "1r Trimestre",
+    "T2": "2n Trimestre",
+    "T3": "3r Trimestre",
+    "T4": "4t Trimestre",
 }
 
 
@@ -3516,11 +4195,13 @@ def list_nas_invoices() -> list[dict[str, Any]]:
             proveidor = parts[1] if len(parts) > 1 else "desconegut"
             any_str = parts[2] if len(parts) > 2 else ""
 
-            # 1. Deducció del Mes (ex: 2026_10_catgas_FG26086862 -> 10)
+            # 1. Deducció del Mes o Trimestre (ex: 2026_10_catgas... -> 10, 2026_T3_veolia... -> T3)
             fn_parts = pdf_path.stem.split("_")
             mes_code = "01"
             if len(fn_parts) >= 2 and fn_parts[1].isdigit():
                 mes_code = fn_parts[1].zfill(2)
+            elif len(fn_parts) >= 2 and fn_parts[1].upper() in ("T1", "T2", "T3", "T4", "Q1", "Q2", "Q3", "Q4"):
+                mes_code = fn_parts[1].upper().replace("Q", "T")
             elif len(fn_parts) >= 2 and "-" in fn_parts[1]:
                 # Si és bimensual/trimestral (ex: 09-10), agafem el primer mes del rang
                 sub_p = fn_parts[1].split("-")
@@ -3529,7 +4210,39 @@ def list_nas_invoices() -> list[dict[str, Any]]:
             else:
                 mes_code = datetime.fromtimestamp(stat.st_mtime).strftime("%m")
 
-            mes_label = f"{MESOS_CATALANS.get(mes_code, mes_code)} ({mes_code})"
+            # Mapeig especial per a factures d'aigua trimestrals (Veolia / Agbar)
+            if proveidor.lower() == "veolia":
+                if mes_code in ("01", "02", "03", "T1"):
+                    mes_label = "1r Trim (T1)"
+                elif mes_code in ("04", "05", "06", "T2"):
+                    mes_label = "2n Trim (T2)"
+                elif mes_code in ("07", "08", "09", "10", "T3"):
+                    mes_label = "3r Trim (T3)"
+                elif mes_code in ("11", "12", "T4"):
+                    mes_label = "4t Trim (T4)"
+                else:
+                    mes_label = f"{MESOS_CATALANS.get(mes_code, mes_code)} ({mes_code})"
+            else:
+                mes_label = f"{MESOS_CATALANS.get(mes_code, mes_code)} ({mes_code})"
+
+            # Deducció de data ISO (YYYY-MM-DD) per al filtratge per rang a la web
+            clean_year = (
+                any_str
+                if any_str.isdigit() and len(any_str) == 4
+                else datetime.fromtimestamp(stat.st_mtime).strftime("%Y")
+            )
+            date_month = "01"
+            if mes_code.isdigit():
+                date_month = mes_code.zfill(2)
+            elif mes_code == "T1":
+                date_month = "03"
+            elif mes_code == "T2":
+                date_month = "06"
+            elif mes_code == "T3":
+                date_month = "09"
+            elif mes_code == "T4":
+                date_month = "12"
+            date_iso = f"{clean_year}-{date_month}-01"
 
             # 2. Deducció de l'Import
             num_clean = pdf_path.stem.lower()
@@ -3572,6 +4285,7 @@ def list_nas_invoices() -> list[dict[str, Any]]:
                     "any": any_str,
                     "mes": mes_code,
                     "mes_label": mes_label,
+                    "date_iso": date_iso,
                     "import_val": import_val,
                     "import_str": import_str,
                     "size_kb": round(stat.st_size / 1024, 1),
@@ -3675,10 +4389,12 @@ async def index(request: Request):
     """Pàgina principal amb dashboard operatiu i controls."""
     invoices = await asyncio.to_thread(list_nas_invoices)
 
-    # Calcular darrera factura per proveïdor
+    # Calcular darrera factura i recompte total de factures per proveïdor
+    count_by_provider: dict[str, int] = {}
     last_by_provider: dict[str, str] = {}
     for inv in invoices:
         prov = inv["proveidor"].lower()
+        count_by_provider[prov] = count_by_provider.get(prov, 0) + 1
         if prov not in last_by_provider:
             last_by_provider[prov] = inv["filename"]
 
@@ -3690,8 +4406,9 @@ async def index(request: Request):
             "enabled": settings.VEOLIA_ENABLED,
             "icon": "droplet",
             "color": "blue",
-            "strategy": "Email (PDF adjunt)",
+            "strategy": "Trigger Email + Portal Agbar",
             "last_invoice": last_by_provider.get("veolia", "Cap factura trobada"),
+            "invoice_count": count_by_provider.get("veolia", 0),
         },
         {
             "id": "catgas",
@@ -3700,8 +4417,9 @@ async def index(request: Request):
             "enabled": settings.CATGAS_ENABLED,
             "icon": "flame",
             "color": "amber",
-            "strategy": "Email (PDF adjunt)",
+            "strategy": "Trigger Email + Oficina Virtual",
             "last_invoice": last_by_provider.get("catgas", "Cap factura trobada"),
+            "invoice_count": count_by_provider.get("catgas", 0),
         },
         {
             "id": "bonpreu",
@@ -3712,6 +4430,7 @@ async def index(request: Request):
             "color": "yellow",
             "strategy": "Trigger Email + Scraper Web",
             "last_invoice": last_by_provider.get("bonpreu", "Cap factura trobada"),
+            "invoice_count": count_by_provider.get("bonpreu", 0),
         },
         {
             "id": "digi",
@@ -3722,6 +4441,7 @@ async def index(request: Request):
             "color": "indigo",
             "strategy": "Trigger Email + Scraper Mi Digi",
             "last_invoice": last_by_provider.get("digi", "Cap factura trobada"),
+            "invoice_count": count_by_provider.get("digi", 0),
         },
     ]
 
@@ -4307,9 +5027,14 @@ FITXER: ./src/web/templates/index.html
               <div class="p-2.5 rounded-xl bg-slate-800/80 text-white border border-slate-700/50">
                 <i data-lucide="{{ card.icon }}" class="w-5 h-5 text-emerald-400"></i>
               </div>
-              <span class="text-[11px] font-medium px-2 py-0.5 rounded-full {% if card.enabled %}bg-emerald-500/10 text-emerald-400 border border-emerald-500/20{% else %}bg-slate-800 text-slate-500 border border-slate-700{% endif %}">
-                {% if card.enabled %}Actiu{% else %}Desactivat{% endif %}
-              </span>
+              <div class="flex items-center gap-1.5">
+                <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-slate-800 text-emerald-400 border border-slate-700/80 font-mono" title="Número de factures desades al sistema">
+                  {{ card.invoice_count }} factures
+                </span>
+                <span class="text-[11px] font-medium px-2 py-0.5 rounded-full {% if card.enabled %}bg-emerald-500/10 text-emerald-400 border border-emerald-500/20{% else %}bg-slate-800 text-slate-500 border border-slate-700{% endif %}">
+                  {% if card.enabled %}Actiu{% else %}Desactivat{% endif %}
+                </span>
+              </div>
             </div>
             
             <h3 class="text-base font-bold text-white">{{ card.name }}</h3>
@@ -4427,12 +5152,23 @@ FITXER: ./src/web/templates/index.html
           <p class="text-xs text-slate-400">Fitxers PDF guardats a <code class="text-emerald-400/90 font-mono">{{ settings.NAS_MOUNT_PATH }}</code></p>
         </div>
 
-        <div class="flex flex-wrap items-center gap-3">
+        <div class="flex flex-wrap items-center gap-2">
           <!-- Comptador dinàmic de factures -->
           <span class="text-xs px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 font-mono flex items-center gap-1.5">
             <i data-lucide="files" class="w-3.5 h-3.5 text-emerald-400"></i>
             <span>Mostrant <strong id="visible-count" class="text-white">{{ invoices|length }}</strong> de {{ invoices|length }}</span>
           </span>
+
+          <!-- Botó "⭐ Mostrar darreres factures" -->
+          <button 
+            type="button" 
+            id="toggle-latest-btn"
+            onclick="toggleLatestInvoices()"
+            title="Mostra exclusivament la darrera factura de cada proveïdor o del seleccionat"
+            class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-300 text-xs font-medium transition cursor-pointer">
+            <i data-lucide="sparkles" class="w-3.5 h-3.5 text-amber-400"></i>
+            <span id="toggle-latest-text">Últimes factures</span>
+          </button>
 
           <!-- Desplegable per filtrar per proveïdor -->
           <select 
@@ -4446,13 +5182,41 @@ FITXER: ./src/web/templates/index.html
             <option value="digi">Digi (Telefonia)</option>
           </select>
 
+          <!-- Filtre per rang de dates -->
+          <div class="flex items-center gap-1.5 bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-slate-400 shadow-inner">
+            <i data-lucide="calendar" class="w-3.5 h-3.5 text-emerald-400"></i>
+            <span class="text-[11px] text-slate-400">De:</span>
+            <input 
+              type="date" 
+              id="date-from" 
+              onchange="filterInvoices()" 
+              title="Data inicial"
+              class="bg-transparent text-slate-200 text-xs outline-none cursor-pointer">
+            <span class="text-[11px] text-slate-400">Fins:</span>
+            <input 
+              type="date" 
+              id="date-to" 
+              onchange="filterInvoices()" 
+              title="Data final"
+              class="bg-transparent text-slate-200 text-xs outline-none cursor-pointer">
+          </div>
+
           <!-- Cercador de text -->
           <input 
             type="text" 
             id="search-input" 
             placeholder="Cercar factura..." 
             onkeyup="filterInvoices()"
-            class="bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:border-emerald-500 outline-none w-48">
+            class="bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:border-emerald-500 outline-none w-40">
+
+          <!-- Botó reset netejar filtres -->
+          <button 
+            type="button" 
+            onclick="resetFilters()"
+            title="Neteja tots els filtres de cerca, dates i proveïdor"
+            class="p-2 rounded-lg bg-slate-950 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-800 transition">
+            <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
+          </button>
         </div>
       </div>
 
@@ -4473,7 +5237,7 @@ FITXER: ./src/web/templates/index.html
           </thead>
           <tbody class="divide-y divide-slate-800/60 font-mono">
             {% for inv in invoices %}
-            <tr class="hover:bg-slate-800/40 transition invoice-row">
+            <tr class="hover:bg-slate-800/40 transition invoice-row" data-provider="{{ inv.proveidor|lower }}" data-date="{{ inv.date_iso }}" data-filename="{{ inv.filename }}">
               <td class="py-3 px-4 font-semibold text-white uppercase">{{ inv.proveidor }}</td>
               <td class="py-3 px-4 text-slate-400">{{ inv.tipus }}</td>
               <td class="py-3 px-4 text-emerald-400 font-bold">{{ inv.any }}</td>
@@ -4745,22 +5509,82 @@ FITXER: ./src/web/templates/index.html
       });
     }
 
+    let onlyLatestActive = false;
+
+    function toggleLatestInvoices() {
+      onlyLatestActive = !onlyLatestActive;
+      const btn = document.querySelector('#toggle-latest-btn');
+      const text = document.querySelector('#toggle-latest-text');
+      if (btn) {
+        if (onlyLatestActive) {
+          btn.classList.add('bg-emerald-600', 'text-white', 'border-emerald-500');
+          btn.classList.remove('bg-slate-950', 'text-slate-300', 'border-slate-800');
+          if (text) text.textContent = 'Només darreres (Actiu)';
+        } else {
+          btn.classList.remove('bg-emerald-600', 'text-white', 'border-emerald-500');
+          btn.classList.add('bg-slate-950', 'text-slate-300', 'border-slate-800');
+          if (text) text.textContent = 'Últimes factures';
+        }
+      }
+      filterInvoices();
+    }
+
+    function resetFilters() {
+      const qInput = document.querySelector('#search-input');
+      const provSelect = document.querySelector('#provider-filter');
+      const dateFrom = document.querySelector('#date-from');
+      const dateTo = document.querySelector('#date-to');
+      if (qInput) qInput.value = '';
+      if (provSelect) provSelect.value = 'all';
+      if (dateFrom) dateFrom.value = '';
+      if (dateTo) dateTo.value = '';
+      if (onlyLatestActive) {
+        toggleLatestInvoices();
+      } else {
+        filterInvoices();
+      }
+    }
+
     function filterInvoices() {
-      const q = document.querySelector('#search-input')?.value.toLowerCase() || '';
+      const q = document.querySelector('#search-input')?.value.toLowerCase().trim() || '';
       const prov = document.querySelector('#provider-filter')?.value.toLowerCase() || 'all';
+      const dFrom = document.querySelector('#date-from')?.value || '';
+      const dTo = document.querySelector('#date-to')?.value || '';
       const rows = document.querySelectorAll('.invoice-row');
       let visibleCount = 0;
 
+      // Seguiment de proveïdors ja mostrats si el mode "només darreres" està actiu
+      const seenProviders = new Set();
+
       rows.forEach(r => {
         const text = r.textContent?.toLowerCase() || '';
-        const rProv = r.querySelector('td:first-child')?.textContent?.toLowerCase().trim() || '';
+        const rProv = r.getAttribute('data-provider') || r.querySelector('td:first-child')?.textContent?.toLowerCase().trim() || '';
+        const rDate = r.getAttribute('data-date') || '';
 
-        const matchesText = text.includes(q);
+        const matchesText = !q || text.includes(q);
         const matchesProv = (prov === 'all') || (rProv === prov);
 
-        if (matchesText && matchesProv) {
+        let matchesDate = true;
+        if (dFrom && rDate) {
+          matchesDate = matchesDate && (rDate >= dFrom);
+        }
+        if (dTo && rDate) {
+          matchesDate = matchesDate && (rDate <= dTo);
+        }
+
+        let isLatestAllowed = true;
+        if (onlyLatestActive) {
+          if (seenProviders.has(rProv)) {
+            isLatestAllowed = false;
+          }
+        }
+
+        if (matchesText && matchesProv && matchesDate && isLatestAllowed) {
           r.style.display = '';
           visibleCount++;
+          if (onlyLatestActive) {
+            seenProviders.add(rProv);
+          }
         } else {
           r.style.display = 'none';
         }
