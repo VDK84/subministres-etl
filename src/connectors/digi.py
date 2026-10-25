@@ -33,6 +33,26 @@ from src.pdf_parser import (
 logger = logging.getLogger("connector.digi")
 
 
+def decode_digi_shifted_font(text: str) -> str:
+    """Descodifica el text de PDFs antics de Digi que tenen el mapa de caràcters de la font desplaçat."""
+    res = []
+    for ch in text:
+        code = ord(ch)
+        if 0x14 <= code <= 0x1D:
+            res.append(str(code - 0x14))
+        elif 0x00 <= code <= 0x60:
+            target = code + 28
+            if 32 <= target <= 126:
+                res.append(chr(target))
+            else:
+                res.append(ch)
+        elif ch in ("\u019d", "Ɲ"):
+            res.append("€")
+        else:
+            res.append(ch)
+    return "".join(res)
+
+
 class DigiConnector(BaseConnector):
     """Connector per a Digi Mobil (Fibra i Telefonia Mòbil).
 
@@ -293,19 +313,23 @@ class DigiConnector(BaseConnector):
         if not text:
             return None
 
+        # Si el PDF té la codificació de font desplaçada de Digi (patró (+*' o *%'896%)
+        if "(+*'" in text or "*%'896%" in text:
+            text = decode_digi_shifted_font(text)
+
         # 1. Número de factura (ex: FACTURA Número: DGFC2210546467)
         num_factura = extract_regex_first(
-            text, r"(?:FACTURA\s+N[úu]mero|N[úu]mero\s*de\s*factura|Factura\s*n[úu]m\.?):\s*([A-Za-z0-9/_-]+)"
+            text, r"(?:FACTURA\s+N[úuʱ]mero|N[úu]mero\s*de\s*factura|Factura\s*n[úu]m\.?):?\s*([A-Za-z0-9/_-]+)"
         )
         if not num_factura:
-            num_factura = extract_regex_first(text, r"(DGFC\d{6,15})")
+            num_factura = extract_regex_first(text, r"\b(DGFC\d{6,15})\b")
         if not num_factura:
             num_factura = extract_regex_first(text, r"Factura\s+([A-Za-z0-9/_-]{6,20})")
 
-        # 2. Període facturat (ex: "16 de septiembre de 2026 a 15 de octubre de 2026" o "01/09/2026 - 30/09/2026")
+        # 2. Període facturat (ex: "16 de septiembre de 2026 a 15 de octubre de 2026" o "16/11/2021 - 15/12/2021")
         dt_inici, dt_fi = extract_date_range(
             text,
-            r"(?:Per[íi]odo\s*(?:de\s*)?facturaci[óo]n|Per[íi]ode\s*facturat|Per[íi]ode):?\s*"
+            r"(?:Per[íi]odo\s*(?:de\s*)?(?:consumo|facturaci[óo]n)|Per[íi]ode\s*facturat|Per[íi]ode):?\s*"
             r"(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})"
             r"\s*(?:al|fins\s*a|a|-)\s*"
             r"(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})",
@@ -314,7 +338,7 @@ class DigiConnector(BaseConnector):
         # 3. Data d'emissió (suportant tant dd/mm/yyyy com "16 de octubre de 2026")
         data_str = extract_regex_first(
             text,
-            r"(?:Fecha\s*(?:de\s*)?emisi[óo]n|Data\s*(?:d')?emissi[óo]|Fecha\s*factura):?\s*\n?\s*"
+            r"(?:Fecha\s*(?:de\s*)?emisi[óoʬ]n|Data\s*(?:d')?emissi[óo]|Fecha\s*factura):?\s*\n?\s*"
             r"(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})",
         )
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
