@@ -211,6 +211,10 @@ MESOS_CATALANS = {
     "10": "Oct",
     "11": "Nov",
     "12": "Des",
+    "T1": "1r Trimestre",
+    "T2": "2n Trimestre",
+    "T3": "3r Trimestre",
+    "T4": "4t Trimestre",
 }
 
 
@@ -236,11 +240,13 @@ def list_nas_invoices() -> list[dict[str, Any]]:
             proveidor = parts[1] if len(parts) > 1 else "desconegut"
             any_str = parts[2] if len(parts) > 2 else ""
 
-            # 1. Deducció del Mes (ex: 2026_10_catgas_FG26086862 -> 10)
+            # 1. Deducció del Mes o Trimestre (ex: 2026_10_catgas... -> 10, 2026_T3_veolia... -> T3)
             fn_parts = pdf_path.stem.split("_")
             mes_code = "01"
             if len(fn_parts) >= 2 and fn_parts[1].isdigit():
                 mes_code = fn_parts[1].zfill(2)
+            elif len(fn_parts) >= 2 and fn_parts[1].upper() in ("T1", "T2", "T3", "T4", "Q1", "Q2", "Q3", "Q4"):
+                mes_code = fn_parts[1].upper().replace("Q", "T")
             elif len(fn_parts) >= 2 and "-" in fn_parts[1]:
                 # Si és bimensual/trimestral (ex: 09-10), agafem el primer mes del rang
                 sub_p = fn_parts[1].split("-")
@@ -249,7 +255,39 @@ def list_nas_invoices() -> list[dict[str, Any]]:
             else:
                 mes_code = datetime.fromtimestamp(stat.st_mtime).strftime("%m")
 
-            mes_label = f"{MESOS_CATALANS.get(mes_code, mes_code)} ({mes_code})"
+            # Mapeig especial per a factures d'aigua trimestrals (Veolia / Agbar)
+            if proveidor.lower() == "veolia":
+                if mes_code in ("01", "02", "03", "T1"):
+                    mes_label = "1r Trim (T1)"
+                elif mes_code in ("04", "05", "06", "T2"):
+                    mes_label = "2n Trim (T2)"
+                elif mes_code in ("07", "08", "09", "10", "T3"):
+                    mes_label = "3r Trim (T3)"
+                elif mes_code in ("11", "12", "T4"):
+                    mes_label = "4t Trim (T4)"
+                else:
+                    mes_label = f"{MESOS_CATALANS.get(mes_code, mes_code)} ({mes_code})"
+            else:
+                mes_label = f"{MESOS_CATALANS.get(mes_code, mes_code)} ({mes_code})"
+
+            # Deducció de data ISO (YYYY-MM-DD) per al filtratge per rang a la web
+            clean_year = (
+                any_str
+                if any_str.isdigit() and len(any_str) == 4
+                else datetime.fromtimestamp(stat.st_mtime).strftime("%Y")
+            )
+            date_month = "01"
+            if mes_code.isdigit():
+                date_month = mes_code.zfill(2)
+            elif mes_code == "T1":
+                date_month = "03"
+            elif mes_code == "T2":
+                date_month = "06"
+            elif mes_code == "T3":
+                date_month = "09"
+            elif mes_code == "T4":
+                date_month = "12"
+            date_iso = f"{clean_year}-{date_month}-01"
 
             # 2. Deducció de l'Import
             num_clean = pdf_path.stem.lower()
@@ -292,6 +330,7 @@ def list_nas_invoices() -> list[dict[str, Any]]:
                     "any": any_str,
                     "mes": mes_code,
                     "mes_label": mes_label,
+                    "date_iso": date_iso,
                     "import_val": import_val,
                     "import_str": import_str,
                     "size_kb": round(stat.st_size / 1024, 1),
@@ -395,10 +434,12 @@ async def index(request: Request):
     """Pàgina principal amb dashboard operatiu i controls."""
     invoices = await asyncio.to_thread(list_nas_invoices)
 
-    # Calcular darrera factura per proveïdor
+    # Calcular darrera factura i recompte total de factures per proveïdor
+    count_by_provider: dict[str, int] = {}
     last_by_provider: dict[str, str] = {}
     for inv in invoices:
         prov = inv["proveidor"].lower()
+        count_by_provider[prov] = count_by_provider.get(prov, 0) + 1
         if prov not in last_by_provider:
             last_by_provider[prov] = inv["filename"]
 
@@ -412,6 +453,7 @@ async def index(request: Request):
             "color": "blue",
             "strategy": "Trigger Email + Portal Agbar",
             "last_invoice": last_by_provider.get("veolia", "Cap factura trobada"),
+            "invoice_count": count_by_provider.get("veolia", 0),
         },
         {
             "id": "catgas",
@@ -422,6 +464,7 @@ async def index(request: Request):
             "color": "amber",
             "strategy": "Trigger Email + Oficina Virtual",
             "last_invoice": last_by_provider.get("catgas", "Cap factura trobada"),
+            "invoice_count": count_by_provider.get("catgas", 0),
         },
         {
             "id": "bonpreu",
@@ -432,6 +475,7 @@ async def index(request: Request):
             "color": "yellow",
             "strategy": "Trigger Email + Scraper Web",
             "last_invoice": last_by_provider.get("bonpreu", "Cap factura trobada"),
+            "invoice_count": count_by_provider.get("bonpreu", 0),
         },
         {
             "id": "digi",
@@ -442,6 +486,7 @@ async def index(request: Request):
             "color": "indigo",
             "strategy": "Trigger Email + Scraper Mi Digi",
             "last_invoice": last_by_provider.get("digi", "Cap factura trobada"),
+            "invoice_count": count_by_provider.get("digi", 0),
         },
     ]
 

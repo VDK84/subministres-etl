@@ -112,9 +112,14 @@
               <div class="p-2.5 rounded-xl bg-slate-800/80 text-white border border-slate-700/50">
                 <i data-lucide="{{ card.icon }}" class="w-5 h-5 text-emerald-400"></i>
               </div>
-              <span class="text-[11px] font-medium px-2 py-0.5 rounded-full {% if card.enabled %}bg-emerald-500/10 text-emerald-400 border border-emerald-500/20{% else %}bg-slate-800 text-slate-500 border border-slate-700{% endif %}">
-                {% if card.enabled %}Actiu{% else %}Desactivat{% endif %}
-              </span>
+              <div class="flex items-center gap-1.5">
+                <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-slate-800 text-emerald-400 border border-slate-700/80 font-mono" title="Número de factures desades al sistema">
+                  {{ card.invoice_count }} factures
+                </span>
+                <span class="text-[11px] font-medium px-2 py-0.5 rounded-full {% if card.enabled %}bg-emerald-500/10 text-emerald-400 border border-emerald-500/20{% else %}bg-slate-800 text-slate-500 border border-slate-700{% endif %}">
+                  {% if card.enabled %}Actiu{% else %}Desactivat{% endif %}
+                </span>
+              </div>
             </div>
             
             <h3 class="text-base font-bold text-white">{{ card.name }}</h3>
@@ -232,12 +237,23 @@
           <p class="text-xs text-slate-400">Fitxers PDF guardats a <code class="text-emerald-400/90 font-mono">{{ settings.NAS_MOUNT_PATH }}</code></p>
         </div>
 
-        <div class="flex flex-wrap items-center gap-3">
+        <div class="flex flex-wrap items-center gap-2">
           <!-- Comptador dinàmic de factures -->
           <span class="text-xs px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-300 font-mono flex items-center gap-1.5">
             <i data-lucide="files" class="w-3.5 h-3.5 text-emerald-400"></i>
             <span>Mostrant <strong id="visible-count" class="text-white">{{ invoices|length }}</strong> de {{ invoices|length }}</span>
           </span>
+
+          <!-- Botó "⭐ Mostrar darreres factures" -->
+          <button 
+            type="button" 
+            id="toggle-latest-btn"
+            onclick="toggleLatestInvoices()"
+            title="Mostra exclusivament la darrera factura de cada proveïdor o del seleccionat"
+            class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-300 text-xs font-medium transition cursor-pointer">
+            <i data-lucide="sparkles" class="w-3.5 h-3.5 text-amber-400"></i>
+            <span id="toggle-latest-text">Últimes factures</span>
+          </button>
 
           <!-- Desplegable per filtrar per proveïdor -->
           <select 
@@ -251,13 +267,41 @@
             <option value="digi">Digi (Telefonia)</option>
           </select>
 
+          <!-- Filtre per rang de dates -->
+          <div class="flex items-center gap-1.5 bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-slate-400 shadow-inner">
+            <i data-lucide="calendar" class="w-3.5 h-3.5 text-emerald-400"></i>
+            <span class="text-[11px] text-slate-400">De:</span>
+            <input 
+              type="date" 
+              id="date-from" 
+              onchange="filterInvoices()" 
+              title="Data inicial"
+              class="bg-transparent text-slate-200 text-xs outline-none cursor-pointer">
+            <span class="text-[11px] text-slate-400">Fins:</span>
+            <input 
+              type="date" 
+              id="date-to" 
+              onchange="filterInvoices()" 
+              title="Data final"
+              class="bg-transparent text-slate-200 text-xs outline-none cursor-pointer">
+          </div>
+
           <!-- Cercador de text -->
           <input 
             type="text" 
             id="search-input" 
             placeholder="Cercar factura..." 
             onkeyup="filterInvoices()"
-            class="bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:border-emerald-500 outline-none w-48">
+            class="bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 focus:border-emerald-500 outline-none w-40">
+
+          <!-- Botó reset netejar filtres -->
+          <button 
+            type="button" 
+            onclick="resetFilters()"
+            title="Neteja tots els filtres de cerca, dates i proveïdor"
+            class="p-2 rounded-lg bg-slate-950 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-800 transition">
+            <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
+          </button>
         </div>
       </div>
 
@@ -278,7 +322,7 @@
           </thead>
           <tbody class="divide-y divide-slate-800/60 font-mono">
             {% for inv in invoices %}
-            <tr class="hover:bg-slate-800/40 transition invoice-row">
+            <tr class="hover:bg-slate-800/40 transition invoice-row" data-provider="{{ inv.proveidor|lower }}" data-date="{{ inv.date_iso }}" data-filename="{{ inv.filename }}">
               <td class="py-3 px-4 font-semibold text-white uppercase">{{ inv.proveidor }}</td>
               <td class="py-3 px-4 text-slate-400">{{ inv.tipus }}</td>
               <td class="py-3 px-4 text-emerald-400 font-bold">{{ inv.any }}</td>
@@ -550,22 +594,82 @@
       });
     }
 
+    let onlyLatestActive = false;
+
+    function toggleLatestInvoices() {
+      onlyLatestActive = !onlyLatestActive;
+      const btn = document.querySelector('#toggle-latest-btn');
+      const text = document.querySelector('#toggle-latest-text');
+      if (btn) {
+        if (onlyLatestActive) {
+          btn.classList.add('bg-emerald-600', 'text-white', 'border-emerald-500');
+          btn.classList.remove('bg-slate-950', 'text-slate-300', 'border-slate-800');
+          if (text) text.textContent = 'Només darreres (Actiu)';
+        } else {
+          btn.classList.remove('bg-emerald-600', 'text-white', 'border-emerald-500');
+          btn.classList.add('bg-slate-950', 'text-slate-300', 'border-slate-800');
+          if (text) text.textContent = 'Últimes factures';
+        }
+      }
+      filterInvoices();
+    }
+
+    function resetFilters() {
+      const qInput = document.querySelector('#search-input');
+      const provSelect = document.querySelector('#provider-filter');
+      const dateFrom = document.querySelector('#date-from');
+      const dateTo = document.querySelector('#date-to');
+      if (qInput) qInput.value = '';
+      if (provSelect) provSelect.value = 'all';
+      if (dateFrom) dateFrom.value = '';
+      if (dateTo) dateTo.value = '';
+      if (onlyLatestActive) {
+        toggleLatestInvoices();
+      } else {
+        filterInvoices();
+      }
+    }
+
     function filterInvoices() {
-      const q = document.querySelector('#search-input')?.value.toLowerCase() || '';
+      const q = document.querySelector('#search-input')?.value.toLowerCase().trim() || '';
       const prov = document.querySelector('#provider-filter')?.value.toLowerCase() || 'all';
+      const dFrom = document.querySelector('#date-from')?.value || '';
+      const dTo = document.querySelector('#date-to')?.value || '';
       const rows = document.querySelectorAll('.invoice-row');
       let visibleCount = 0;
 
+      // Seguiment de proveïdors ja mostrats si el mode "només darreres" està actiu
+      const seenProviders = new Set();
+
       rows.forEach(r => {
         const text = r.textContent?.toLowerCase() || '';
-        const rProv = r.querySelector('td:first-child')?.textContent?.toLowerCase().trim() || '';
+        const rProv = r.getAttribute('data-provider') || r.querySelector('td:first-child')?.textContent?.toLowerCase().trim() || '';
+        const rDate = r.getAttribute('data-date') || '';
 
-        const matchesText = text.includes(q);
+        const matchesText = !q || text.includes(q);
         const matchesProv = (prov === 'all') || (rProv === prov);
 
-        if (matchesText && matchesProv) {
+        let matchesDate = true;
+        if (dFrom && rDate) {
+          matchesDate = matchesDate && (rDate >= dFrom);
+        }
+        if (dTo && rDate) {
+          matchesDate = matchesDate && (rDate <= dTo);
+        }
+
+        let isLatestAllowed = true;
+        if (onlyLatestActive) {
+          if (seenProviders.has(rProv)) {
+            isLatestAllowed = false;
+          }
+        }
+
+        if (matchesText && matchesProv && matchesDate && isLatestAllowed) {
           r.style.display = '';
           visibleCount++;
+          if (onlyLatestActive) {
+            seenProviders.add(rProv);
+          }
         } else {
           r.style.display = 'none';
         }

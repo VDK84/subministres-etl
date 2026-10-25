@@ -514,21 +514,55 @@ class VeoliaConnector(BaseConnector):
         if not text:
             return None
 
-        # 1. Número de factura
-        # Exemples: "Número factura: 2026/123456" o "Factura núm. B12345678"
-        num_factura = extract_regex_first(text, r"(?:Factura\s*n[úu]m\.?|N[úu]mero\s*factura:?)\s*([A-Za-z0-9/_-]+)")
-        if not num_factura:
-            num_factura = extract_regex_first(text, r"Factura\s+([A-Za-z0-9/_-]{6,20})")
+        # 1. Detecció de Període Trimestral (Veolia / Agbar facturem per trimestres, ex: 2026/3 o 3 / 2026)
+        quarter: int | None = None
+        quarter_year: int | None = None
 
-        # 2. Data d'emissió
-        data_str = extract_regex_first(
-            text, r"(?:Data\s*d'emissi[óo]|Fecha\s*emisi[óo]n):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+        quarter_match = re.search(
+            r"(?:Per[íi]ode(?:[\s\w]*?):?[\s]*)(?:(\d{4})\s*[/_-]\s*([1-4])|([1-4])\s*[/_-]\s*(\d{4})|([1-4])[ººrrtT]?\s*(?:trimestre|trim\.?)\s*(?:de(?:l)?)?\s*(\d{4}))",
+            text,
+            re.IGNORECASE,
         )
+        if quarter_match:
+            g1, g2, g3, g4, g5, g6 = quarter_match.groups()
+            if g1 and g2:
+                quarter_year, quarter = int(g1), int(g2)
+            elif g3 and g4:
+                quarter, quarter_year = int(g3), int(g4)
+            elif g5 and g6:
+                quarter, quarter_year = int(g5), int(g6)
+        else:
+            # Cerca genèrica de patró trimestre/any (ex: "3 / 2026" o "2026/3")
+            simple_q = re.search(r"\b([1-4])\s*/\s*(\d{4})\b|\b(\d{4})\s*/\s*([1-4])\b", text)
+            if simple_q:
+                q_a, y_a, y_b, q_b = simple_q.groups()
+                if q_a and y_a and 2000 <= int(y_a) <= 2100:
+                    quarter, quarter_year = int(q_a), int(y_a)
+                elif y_b and q_b and 2000 <= int(y_b) <= 2100:
+                    quarter_year, quarter = int(y_b), int(q_b)
+
+        # 2. Número de factura
+        # Exemples: "Número factura: 2026/123456", "Factura núm. B12345678", "Núm. 22272026A100094695"
+        num_factura = extract_regex_first(
+            text,
+            r"(?:Factura\s*(?:n[úu]m\.?|n[ºº])|N[úu]mero\s*(?:de\s*)?factura|N[úu]m\.?\s*(?:de\s*)?factura|N[úu]m\.?)\s*:?\s*([A-Za-z0-9/_-]{6,30})",
+        )
+        if not num_factura:
+            num_factura = extract_regex_first(text, r"Factura\s+([A-Za-z0-9/_-]{6,25})")
+
+        # 3. Data d'emissió
+        data_str = extract_regex_first(
+            text,
+            r"(?:Data\s*(?:d'emissi[óo]|emisi[óo]n|factura|de\s*la\s*factura)?|Fecha\s*(?:de\s*)?emisi[óo]n?):?\s*(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})",
+        )
+        if not data_str:
+            data_str = extract_regex_first(text, r"(?:Data|Fecha):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})")
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
 
-        # 3. Import total
+        # 4. Import total
         total_eur = extract_float_value(
-            text, r"(?:Total\s*factura|Import\s*total|Total\s*a\s*pagar):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?"
+            text,
+            r"(?:Total\s*(?:factura|a\s*pagar|rebut)?|Import\s*total|Total|Importe\s*total):?\s*(\d+(?:[.,]\d{1,2})?)\s*€?",
         )
         if total_eur is None:
             total_eur = parse_euro_amount(text)
@@ -537,34 +571,70 @@ class VeoliaConnector(BaseConnector):
         if total_eur is None:
             return None
 
-        # 4. Consum d'aigua en m3
-        # Exemples: "Consum facturat: 12 m3" o "Consum del període: 14 m³"
+        # 5. Consum d'aigua en m3
+        # Exemples: "Consum facturat: 12 m3", "Consum del període: 14 m³", "Consum: 12 m3"
         consum_m3 = extract_float_value(
-            text, r"(?:Consum\s*facturat|Consumo\s*facturado|Consum\s*per[íi]ode):?\s*(\d+(?:[.,]\d{1,2})?)\s*m[3³]"
+            text,
+            r"(?:Consum\s*(?:facturat|del\s*per[íi]ode|total)?|Consumo\s*(?:facturado)?):?\s*(\d+(?:[.,]\d{1,2})?)\s*m[3³]",
         )
         if consum_m3 is None:
             consum_m3 = extract_float_value(text, r"(\d+(?:[.,]\d{1,2})?)\s*m[3³]")
 
-        # 5. Dates del període
+        # 6. Dates del període
         dt_inici, dt_fi = extract_date_range(
             text,
             r"(?:Per[íi]ode\s*facturat|Per[íi]odo):?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:a|fins\s*a|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
         )
 
-        # 6. Referència o contracte
+        # Si no hem trobat rang de dates explícit per regex, però tenim el trimestre (ex: 2026/3):
+        if (not dt_inici or not dt_fi) and quarter and quarter_year:
+            quarter_ranges = {
+                1: (date(quarter_year, 1, 1), date(quarter_year, 3, 31)),
+                2: (date(quarter_year, 4, 1), date(quarter_year, 6, 30)),
+                3: (date(quarter_year, 7, 1), date(quarter_year, 9, 30)),
+                4: (date(quarter_year, 10, 1), date(quarter_year, 12, 31)),
+            }
+            if quarter in quarter_ranges:
+                dt_inici, dt_fi = quarter_ranges[quarter]
+
+        # Si no tenim data d'emissió però tenim trimestre, establim la fi del trimestre com a referència
+        if not data_emissio:
+            if dt_fi:
+                data_emissio = dt_fi
+            else:
+                data_emissio = date.today()
+
+        # 7. Referència o contracte
         contracte = extract_regex_first(text, r"(?:Contracte|Contrato|P[òo]lissa):?\s*([0-9A-Za-z/_-]+)")
+
+        dies = (dt_fi - dt_inici).days + 1 if (dt_inici and dt_fi) else None
+
+        tags_extra: dict[str, str] = {}
+        fields_extra: dict[str, float] = {}
+        if quarter:
+            tags_extra["trimestre"] = f"T{quarter}"
+            if quarter_year:
+                tags_extra["periode_trimestral"] = f"{quarter_year}/T{quarter}"
+            fields_extra["trimestre_num"] = float(quarter)
 
         return FacturaMetriques(
             proveidor=self.name,
             tipus=self.tipus,
-            numero_factura=num_factura or f"VEOLIA-{date.today().isoformat()}",
-            data_emissio=data_emissio or date.today(),
+            numero_factura=num_factura
+            or (
+                f"VEOLIA-{quarter_year}T{quarter}"
+                if (quarter and quarter_year)
+                else f"VEOLIA-{date.today().isoformat()}"
+            ),
+            data_emissio=data_emissio,
             periode_inici=dt_inici,
             periode_fi=dt_fi,
-            dies_facturats=(dt_fi - dt_inici).days if (dt_inici and dt_fi) else None,
+            dies_facturats=dies,
             import_total=float(total_eur),
             consum_m3=consum_m3,
             cups_o_referencia=contracte,
+            tags_extra=tags_extra,
+            fields_extra=fields_extra,
         )
 
     def _fallback_metrics(self, pdf_bytes: bytes, fallback_date: date) -> FacturaMetriques | None:

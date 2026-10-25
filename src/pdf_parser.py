@@ -76,34 +76,55 @@ def parse_euro_amount(text: str) -> float | None:
 
 
 def parse_date_catalan_spanish(date_str: str) -> date | None:
-    """Intenta parsejar dates típiques en català o castellà (ex: 15/09/2026, 15 d'octubre de 2026)."""
+    """Intenta parsejar dates típiques en català o castellà (ex: 15/09/2026, 15 d'octubre de 2026, 09 d'oct. 2026)."""
     months_map = {
         "gener": "01",
         "enero": "01",
+        "gen": "01",
+        "ene": "01",
         "febrer": "02",
         "febrero": "02",
+        "feb": "02",
         "març": "03",
         "marzo": "03",
+        "mar": "03",
         "abril": "04",
+        "abr": "04",
         "maig": "05",
         "mayo": "05",
+        "mai": "05",
+        "may": "05",
         "juny": "06",
         "junio": "06",
+        "jun": "06",
         "juliol": "07",
         "julio": "07",
+        "jul": "07",
         "agost": "08",
         "agosto": "08",
+        "ago": "08",
         "setembre": "09",
         "septiembre": "09",
+        "set": "09",
+        "sep": "09",
         "octubre": "10",
+        "oct": "10",
         "novembre": "11",
         "noviembre": "11",
+        "nov": "11",
         "desembre": "12",
         "diciembre": "12",
+        "des": "12",
+        "dic": "12",
     }
-    clean = date_str.lower()
+    clean = date_str.lower().strip()
+    # Netejar connectors en català/castellà com "d'", "d’", "de ", "del "
+    clean = re.sub(r"\bd\s*['’]\s*", "", clean)
+    clean = re.sub(r"\bde\s+", "", clean)
+    clean = re.sub(r"\bdel\s+", "", clean)
+
     for cat_es, num in months_map.items():
-        clean = re.sub(rf"\b{cat_es}\b", num, clean)
+        clean = re.sub(rf"\b{cat_es}\.?\b", num, clean)
     clean = re.sub(r"[^\w\s/.-]", " ", clean)
 
     try:
