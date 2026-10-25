@@ -329,17 +329,15 @@ class DigiConnector(BaseConnector):
         # 2. Període facturat (ex: "16 de septiembre de 2026 a 15 de octubre de 2026" o "16/11/2021 - 15/12/2021")
         dt_inici, dt_fi = extract_date_range(
             text,
-            r"(?:Per[íi]odo\s*(?:de\s*)?(?:consumo|facturaci[óo]n)|Per[íi]ode\s*facturat|Per[íi]ode):?\s*"
-            r"(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})"
-            r"\s*(?:al|fins\s*a|a|-)\s*"
+            r"(?:Per[íi]odo\s*(?:de\s*)?(?:consumo|facturaci[óo]n)|Per[íi]ode\s*facturat|Per[íi]ode)[^0-9]{0,25}?(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})"
+            r"\s*(?:al|fins\s*a|a|[-–—])\s*"
             r"(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})",
         )
 
         # 3. Data d'emissió (suportant tant dd/mm/yyyy com "16 de octubre de 2026")
         data_str = extract_regex_first(
             text,
-            r"(?:Fecha\s*(?:de\s*)?emisi[óoʬ]n|Data\s*(?:d')?emissi[óo]|Fecha\s*factura):?\s*\n?\s*"
-            r"(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})",
+            r"(?:Fecha\s*(?:de\s*)?emisi[óoʬ]n|Data\s*(?:d')?emissi[óo]|Fecha\s*factura)[^0-9]{0,25}?(\d{1,2}(?:\s*(?:de|d'|/|-)\s*|\s+)[a-zA-ZÀ-ÿ0-9.]+(?:\s*(?:de|del|/|-)\s*|\s+)\d{2,4})",
         )
         data_emissio = parse_date_catalan_spanish(data_str) if data_str else None
 
@@ -359,9 +357,10 @@ class DigiConnector(BaseConnector):
         # 4. Import total (cercant específicament els patrons d'import amb coma decimal de Digi)
         total_eur: float | None = None
         digi_total_patterns = [
-            r"(?:TOTAL\s+A\s+PAGAR|TOTAL\s+FACTURA|Importe\s+total|Total\s+factura)[^0-9€]{0,60}?(\d{1,3}[.,]\d{2})\s*€",
-            r"(\d{1,3}[.,]\d{2})\s*€\s*(?:TOTAL\s+FACTURA|TOTAL\s+A\s+PAGAR)",
+            r"(\d{1,3}[.,]\d{2})\s*€?\s*TOTAL\s*FACTURA",
+            r"(?:TOTAL\s+A\s+PAGAR|Total\s+a\s+pagar)[^0-9€]{0,50}?(\d{1,3}[.,]\d{2})\s*€?",
             r"TOTAL\s+SERVICIOS[^0-9€]{0,40}?(\d{1,3}[.,]\d{2})\s*€",
+            r"TOTAL\s+FACTURA[^0-9€]{0,40}?(\d{1,3}[.,]\d{2})\s*€",
         ]
         for pat in digi_total_patterns:
             val = extract_float_value(text, pat)
