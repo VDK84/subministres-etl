@@ -356,6 +356,11 @@ def reparse_and_fix_nas_invoices() -> tuple[int, int]:
     processed = 0
     renamed = 0
 
+    # Netejar prèviament totes les mètriques d'InfluxDB per eliminar qualsevol punt fantasma/residu antic
+    for prov in ["bonpreu", "catgas", "veolia", "digi"]:
+        influx_writer.delete_factura_metrics(prov)
+    logger.info("🗑️ Netejats tots els punts anteriors a InfluxDB abans de la re-ingesta.")
+
     all_pdfs = list(root.glob("**/*.pdf"))
     total = len(all_pdfs)
 
@@ -402,8 +407,7 @@ def reparse_and_fix_nas_invoices() -> tuple[int, int]:
                 renamed += 1
                 logger.info(f"🔧 Corregida ubicació/data: {pdf_path.name} -> {expected_path.name}")
 
-            # Netejar mètrica antiga a InfluxDB i escriure la nova corregida
-            influx_writer.delete_factura_metrics(proveidor, metriques.numero_factura)
+            # Escriure la nova mètrica neta a InfluxDB
             influx_writer.write_factura_metrics(metriques)
             processed += 1
         except (OSError, RuntimeError, ValueError) as err:
