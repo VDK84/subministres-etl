@@ -542,13 +542,15 @@ class VeoliaConnector(BaseConnector):
                     quarter_year, quarter = int(y_b), int(q_b)
 
         # 2. Número de factura
-        # Exemples: "Número factura: 2026/123456", "Factura núm. B12345678", "Núm. 22272026A100094695"
+        # Exemples: "Núm. factura 22272026A100094695" o "Núm. factura\n22272026A100046989"
         num_factura = extract_regex_first(
             text,
-            r"(?:Factura\s*(?:n[úu]m\.?|n[ºº])|N[úu]mero\s*(?:de\s*)?factura|N[úu]m\.?\s*(?:de\s*)?factura|N[úu]m\.?)\s*:?\s*([A-Za-z0-9/_-]{6,30})",
+            r"(?:N[úu]m\.?\s*factura|N[úu]mero\s*(?:de\s*)?factura|Factura\s*n[úu]m\.?)\s*:?\s*\n?\s*([0-9A-Za-z]{8,30})",
         )
-        if not num_factura:
-            num_factura = extract_regex_first(text, r"Factura\s+([A-Za-z0-9/_-]{6,25})")
+        if not num_factura or num_factura.lower() in ("contracte", "factura", "trimestral"):
+            num_factura = extract_regex_first(text, r"\b(2227\d{4}[A-Za-z]\d{6,12})\b")
+        if not num_factura or num_factura.lower() in ("contracte", "factura", "trimestral"):
+            num_factura = extract_regex_first(text, r"\b(\d{7,10}[A-Za-z]\d{7,12})\b")
 
         # 3. Data d'emissió
         data_str = extract_regex_first(
