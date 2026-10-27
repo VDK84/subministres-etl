@@ -15,6 +15,7 @@ from src.connectors import (
     VeoliaConnector,
 )
 from src.email_client import imap_client
+from src.health import health_manager
 from src.models import FacturaResult
 
 console = Console()
@@ -89,11 +90,21 @@ def run_etl(connector_filter: str | None = None) -> int:
         try:
             results = connector.run(imap_client)
             all_results.extend(results)
+            connector_errors = []
             for res in results:
                 if res.errors:
                     has_errors = True
+                    connector_errors.extend(res.errors)
+
+            if connector_errors:
+                health_manager.record_incident(
+                    connector.name, "; ".join(connector_errors), severity="warning", source="cronjob"
+                )
+            else:
+                health_manager.record_success(connector.name, source="cronjob", clear_incidents=bool(results))
         except (OSError, RuntimeError, ValueError) as e:
             logger.error(f"Error crític executant el connector {connector.name}: {e}")
+            health_manager.record_incident(connector.name, str(e), severity="error", source="cronjob")
             has_errors = True
 
     if all_results:

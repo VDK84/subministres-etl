@@ -77,6 +77,31 @@
           <span class="text-slate-300">NAS Samba</span>
         </div>
 
+        <!-- Botó Global d'Incidències / Estat de Salut -->
+        {% if global_health.total_incidents != 0 %}
+        <button 
+          type="button"
+          hx-get="/api/incidents?proveidor=all"
+          hx-target="#incidents-modal-content"
+          onclick="openIncidentsModal()"
+          title="Hi ha incidències pendents de revisió. Clica per veure el detall."
+          class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg {% if global_health.has_errors %}bg-red-950/80 border-red-500/50 text-red-300 hover:bg-red-900/80{% else %}bg-amber-950/80 border-amber-500/50 text-amber-300 hover:bg-amber-900/80{% endif %} border font-semibold transition cursor-pointer shadow-sm text-xs">
+          <i data-lucide="alert-triangle" class="w-4 h-4 {% if global_health.has_errors %}text-red-400 animate-bounce{% else %}text-amber-400{% endif %}"></i>
+          <span>{{ global_health.total_incidents }} Incidènci{% if global_health.total_incidents == 1 %}a{% else %}es{% endif %}</span>
+        </button>
+        {% else %}
+        <button 
+          type="button"
+          hx-get="/api/incidents?proveidor=all"
+          hx-target="#incidents-modal-content"
+          onclick="openIncidentsModal()"
+          title="Tots els subministraments funcionen sense errors"
+          class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-950/50 hover:bg-emerald-900/60 border border-emerald-700/40 text-emerald-300 font-medium transition cursor-pointer text-xs">
+          <i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-400"></i>
+          <span>Sistema OK</span>
+        </button>
+        {% endif %}
+
         <button 
           hx-post="/api/sync" 
           hx-target="#notification-area"
@@ -113,6 +138,29 @@
                 <i data-lucide="{{ card.icon }}" class="w-5 h-5 text-emerald-400"></i>
               </div>
               <div class="flex items-center gap-1.5">
+                {% if card.incident_count != 0 %}
+                <button
+                  type="button"
+                  hx-get="/api/incidents?proveidor={{ card.id }}"
+                  hx-target="#incidents-modal-content"
+                  onclick="openIncidentsModal()"
+                  title="Veure {{ card.incident_count }} incidències de {{ card.name }}"
+                  class="flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-full {% if card.has_errors %}bg-red-500/20 text-red-300 border border-red-500/40 hover:bg-red-500/30{% else %}bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30{% endif %} transition cursor-pointer">
+                  <i data-lucide="alert-triangle" class="w-3 h-3"></i>
+                  <span>{{ card.incident_count }}</span>
+                </button>
+                {% else %}
+                <button
+                  type="button"
+                  hx-get="/api/incidents?proveidor={{ card.id }}"
+                  hx-target="#incidents-modal-content"
+                  onclick="openIncidentsModal()"
+                  title="{{ card.name }} sense incidències"
+                  class="flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 transition cursor-pointer">
+                  <i data-lucide="check" class="w-3 h-3"></i>
+                  <span>OK</span>
+                </button>
+                {% endif %}
                 <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-slate-800 text-emerald-400 border border-slate-700/80 font-mono" title="Número de factures desades al sistema">
                   {{ card.invoice_count }} factures
                 </span>
@@ -134,6 +182,12 @@
                 <span class="shrink-0">Última factura:</span>
                 <span class="text-slate-300 font-mono text-[11px] truncate text-right" title="{{ card.last_invoice }}">
                   {{ card.last_invoice }}
+                </span>
+              </div>
+              <div class="flex items-center justify-between text-slate-400 gap-2 pt-0.5">
+                <span class="shrink-0">Últim èxit:</span>
+                <span class="text-emerald-400/90 font-mono text-[11px] truncate text-right" title="Última vegada que l'extracció ha funcionat">
+                  {{ card.last_success_at }}
                 </span>
               </div>
             </div>
@@ -437,6 +491,15 @@
           <i data-lucide="loader-2" class="w-8 h-8 text-emerald-400 animate-spin"></i>
           <span>Consultant factures disponibles a la companyia...</span>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal per al Centre d'Incidències i Avisos -->
+  <div id="incidents-modal" class="fixed inset-0 z-50 hidden bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-3xl max-h-[85vh] flex flex-col shadow-2xl overflow-hidden">
+      <div id="incidents-modal-content">
+        <div class="p-8 text-center text-slate-400">Carregant incidències...</div>
       </div>
     </div>
   </div>
@@ -954,6 +1017,20 @@
         console.error('No s\'ha pogut establir connexió WebSocket:', err);
       }
     }
+
+    function openIncidentsModal() {
+      const modal = document.querySelector('#incidents-modal');
+      if (modal) modal.classList.remove('hidden');
+    }
+
+    function closeIncidentsModal() {
+      const modal = document.querySelector('#incidents-modal');
+      if (modal) modal.classList.add('hidden');
+    }
+
+    document.body.addEventListener('incidentsCleared', function() {
+      setTimeout(() => window.location.reload(), 600);
+    });
 
     // Inicialitzar el WebSocket al carregar la pàgina
     initWebSocketLogs();

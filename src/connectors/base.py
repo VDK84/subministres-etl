@@ -7,6 +7,7 @@ from typing import Any
 
 from src.config import settings
 from src.email_client import ImapMailboxClient
+from src.health import health_manager
 from src.influx_writer import influx_writer
 from src.models import FacturaMetriques, FacturaResult, SubministreType
 from src.storage import storage
@@ -37,6 +38,10 @@ class BaseConnector(ABC):
         pct = int((current / total) * 100) if total > 0 else 0
         counter_str = f"[{current}/{total}] " if total > 0 else ""
         self.logger.info(f"[{self.name.upper()}] {counter_str}{step}")
+
+        if status in ("error", "warning"):
+            health_manager.record_incident(self.name, step, severity=status)
+
         if self.progress_callback:
             try:
                 self.progress_callback(
@@ -66,20 +71,24 @@ class BaseConnector(ABC):
     def record_failure(self, reason: str) -> None:
         """Registra un error consecutiu i activa el bloqueig preventiu si cal."""
         self.consecutive_failures += 1
+        health_manager.record_incident(self.name, reason, severity="error")
         self.logger.warning(
             f"⚠️ Intent fallit ({self.consecutive_failures}/{settings.MAX_SCRAPER_RETRIES}) per a {self.name.upper()}: {reason}"
         )
         if self.consecutive_failures >= settings.MAX_SCRAPER_RETRIES:
             self.cooldown_until = datetime.now() + timedelta(minutes=settings.SCRAPER_COOLDOWN_MINUTES)
-            self.logger.error(
+            cb_msg = (
                 f"⛔ CIRCUIT BREAKER ACTIVAT per a {self.name.upper()}: S'han assolit {settings.MAX_SCRAPER_RETRIES} intents fallits. "
                 f"Pausa preventiva de {settings.SCRAPER_COOLDOWN_MINUTES} minuts activada."
             )
+            self.logger.error(cb_msg)
+            health_manager.record_incident(self.name, cb_msg, severity="error")
 
-    def record_success(self) -> None:
-        """Reinicia el comptador d'errors en cas d'èxit."""
+    def record_success(self, source: str = "portal") -> None:
+        """Reinicia el comptador d'errors en cas d'èxit i actualitza l'última data d'èxit."""
         self.consecutive_failures = 0
         self.cooldown_until = None
+        health_manager.record_success(self.name, source=source)
 
     @abstractmethod
     def is_enabled(self) -> bool:
@@ -150,7 +159,11 @@ class BaseConnector(ABC):
         influx_ok = influx_writer.write_factura_metrics(metriques)
         errors: list[str] = []
         if not influx_ok and settings.INFLUXDB_ENABLED and not settings.DRY_RUN:
-            errors.append("Error en enviar mètriques a InfluxDB")
+            err_msg = f"Error en enviar mètriques de la factura {metriques.numero_factura} a InfluxDB"
+            errors.append(err_msg)
+            health_manager.record_incident(self.name, err_msg, severity="warning", source=origen)
+        else:
+            health_manager.record_success(self.name, source=origen, clear_incidents=False)
 
         return FacturaResult(
             proveidor=self.name,

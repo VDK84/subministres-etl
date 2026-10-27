@@ -37,6 +37,7 @@ from src.connectors import (
     VeoliaConnector,
 )
 from src.email_client import decode_str, imap_client
+from src.health import health_manager
 from src.influx_writer import influx_writer
 from src.models import FacturaMetriques, FacturaResult
 from src.pdf_parser import extract_text_from_pdf_bytes, parse_euro_amount
@@ -542,11 +543,19 @@ async def index(request: Request):
     # Calcular darrera factura i recompte total de factures per proveïdor
     count_by_provider: dict[str, int] = {}
     last_by_provider: dict[str, str] = {}
+    last_mod_by_provider: dict[str, str] = {}
     for inv in invoices:
         prov = inv["proveidor"].lower()
         count_by_provider[prov] = count_by_provider.get(prov, 0) + 1
         if prov not in last_by_provider:
             last_by_provider[prov] = inv["filename"]
+            last_mod_by_provider[prov] = inv["modified"]
+
+    veolia_health = health_manager.get_provider_health("veolia", last_mod_by_provider.get("veolia"))
+    catgas_health = health_manager.get_provider_health("catgas", last_mod_by_provider.get("catgas"))
+    bonpreu_health = health_manager.get_provider_health("bonpreu", last_mod_by_provider.get("bonpreu"))
+    digi_health = health_manager.get_provider_health("digi", last_mod_by_provider.get("digi"))
+    global_health = health_manager.get_global_summary()
 
     status_cards = [
         {
@@ -559,6 +568,9 @@ async def index(request: Request):
             "strategy": "Trigger Email + Portal Agbar",
             "last_invoice": last_by_provider.get("veolia", "Cap factura trobada"),
             "invoice_count": count_by_provider.get("veolia", 0),
+            "last_success_at": veolia_health["last_success_at"],
+            "incident_count": veolia_health["incident_count"],
+            "has_errors": veolia_health["has_errors"],
         },
         {
             "id": "catgas",
@@ -570,6 +582,9 @@ async def index(request: Request):
             "strategy": "Trigger Email + Oficina Virtual",
             "last_invoice": last_by_provider.get("catgas", "Cap factura trobada"),
             "invoice_count": count_by_provider.get("catgas", 0),
+            "last_success_at": catgas_health["last_success_at"],
+            "incident_count": catgas_health["incident_count"],
+            "has_errors": catgas_health["has_errors"],
         },
         {
             "id": "bonpreu",
@@ -581,6 +596,9 @@ async def index(request: Request):
             "strategy": "Trigger Email + Scraper Web",
             "last_invoice": last_by_provider.get("bonpreu", "Cap factura trobada"),
             "invoice_count": count_by_provider.get("bonpreu", 0),
+            "last_success_at": bonpreu_health["last_success_at"],
+            "incident_count": bonpreu_health["incident_count"],
+            "has_errors": bonpreu_health["has_errors"],
         },
         {
             "id": "digi",
@@ -592,6 +610,9 @@ async def index(request: Request):
             "strategy": "Trigger Email + Scraper Mi Digi",
             "last_invoice": last_by_provider.get("digi", "Cap factura trobada"),
             "invoice_count": count_by_provider.get("digi", 0),
+            "last_success_at": digi_health["last_success_at"],
+            "incident_count": digi_health["incident_count"],
+            "has_errors": digi_health["has_errors"],
         },
     ]
 
@@ -605,6 +626,7 @@ async def index(request: Request):
             "invoices": invoices,
             "logs": list(log_buffer),
             "settings": settings,
+            "global_health": global_health,
         },
     )
 
@@ -820,6 +842,107 @@ async def get_connector_history(connector: str):
     </div>
     """
     return HTMLResponse(modal_html)
+
+
+@app.get("/api/incidents", response_class=HTMLResponse)
+async def get_incidents_modal(proveidor: str = "all"):
+    """Retorna el contingut HTML del pop-up d'incidències (global o filtrat per proveïdor)."""
+    prov_clean = proveidor.strip().lower()
+    summary = health_manager.get_global_summary()
+    all_inc = summary["incidents"]
+
+    if prov_clean and prov_clean != "all":
+        incidents = [i for i in all_inc if i.get("proveidor") == prov_clean]
+        title_scope = f"Incidències — {html.escape(prov_clean.upper())}"
+    else:
+        incidents = all_inc
+        title_scope = "Centre Global d'Incidències i Avisos"
+
+    items_html = []
+    for inc in incidents:
+        sev = inc.get("severity", "error")
+        is_err = sev == "error"
+        border_cls = "border-red-500/30 bg-red-950/20" if is_err else "border-amber-500/30 bg-amber-950/20"
+        badge_cls = (
+            "bg-red-500/20 text-red-300 border-red-500/40"
+            if is_err
+            else "bg-amber-500/20 text-amber-300 border-amber-500/40"
+        )
+        prov_name = html.escape(str(inc.get("proveidor", "")).upper())
+        title_txt = html.escape(str(inc.get("title", "Incidència")))
+        msg_txt = html.escape(str(inc.get("message", "")))
+        hint_txt = html.escape(str(inc.get("hint", "")))
+        ts_txt = html.escape(str(inc.get("timestamp", "")))
+        try:
+            count_val = int(inc.get("count", 1))
+        except (ValueError, TypeError):
+            count_val = 1
+        count_badge = (
+            f'<span class="px-1.5 py-0.5 text-[10px] rounded bg-slate-800 text-slate-300 font-mono">x{count_val}</span>'
+            if count_val > 1
+            else ""
+        )
+
+        items_html.append(
+            f'<div class="p-4 rounded-xl border {border_cls} space-y-2">'
+            f'  <div class="flex flex-wrap items-center justify-between gap-2">'
+            f'    <div class="flex items-center gap-2">'
+            f'      <span class="px-2 py-0.5 rounded text-[11px] font-bold border {badge_cls}">{prov_name}</span>'
+            f'      <span class="text-sm font-semibold text-white">{title_txt}</span>'
+            f"      {count_badge}"
+            f"    </div>"
+            f'    <span class="text-xs font-mono text-slate-400">{ts_txt}</span>'
+            f"  </div>"
+            f'  <p class="text-xs font-mono text-slate-200 bg-slate-950/70 p-2.5 rounded-lg border border-slate-800 break-words">{msg_txt}</p>'
+            f'  <p class="text-[11px] text-slate-400 flex items-center gap-1.5">💡 <span>{hint_txt}</span></p>'
+            f"</div>"
+        )
+
+    if not items_html:
+        body_html = (
+            '<div class="py-12 text-center space-y-3">'
+            '  <div class="w-12 h-12 mx-auto rounded-full bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 text-xl">✓</div>'
+            '  <h4 class="text-sm font-bold text-white">Tot funciona correctament!</h4>'
+            '  <p class="text-xs text-slate-400">No hi ha cap incidència ni error pendent de revisió.</p>'
+            "</div>"
+        )
+    else:
+        body_html = f'<div class="space-y-3 max-h-96 overflow-y-auto pr-1">{"".join(items_html)}</div>'
+
+    clear_btn = ""
+    if incidents:
+        clear_btn = (
+            f'<button type="button" hx-post="/api/incidents/clear" hx-vals=\'{{"proveidor": "{html.escape(prov_clean)}"}}\' '
+            f'hx-target="#incidents-modal-content" '
+            f'class="px-3 py-1.5 bg-slate-800 hover:bg-red-950/60 text-slate-200 hover:text-red-300 text-xs font-medium rounded-lg border border-slate-700 hover:border-red-700/50 transition cursor-pointer">'
+            f"🧹 Netejar incidències</button>"
+        )
+
+    return HTMLResponse(
+        f'<div class="p-6 space-y-5">'
+        f'  <div class="flex items-center justify-between border-b border-slate-800 pb-4">'
+        f"    <div>"
+        f'      <h3 class="text-base font-bold text-white flex items-center gap-2">🔔 {title_scope}</h3>'
+        f'      <p class="text-xs text-slate-400">Resum d\'errors de 2FA, canvis de parser o timeouts recents ({len(incidents)} registres)</p>'
+        f"    </div>"
+        f'    <div class="flex items-center gap-2">'
+        f"      {clear_btn}"
+        f'      <button type="button" onclick="closeIncidentsModal()" class="text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-slate-800 cursor-pointer">✕</button>'
+        f"    </div>"
+        f"  </div>"
+        f"  {body_html}"
+        f"</div>"
+    )
+
+
+@app.post("/api/incidents/clear", response_class=HTMLResponse)
+async def clear_incidents_endpoint(proveidor: str = Form(default="all")):
+    """Neteja les incidències i refresca el modal i la pàgina."""
+    prov_clean = proveidor.strip().lower()
+    health_manager.clear_incidents(None if prov_clean == "all" else prov_clean)
+    resp = await get_incidents_modal(prov_clean)
+    resp.headers["HX-Trigger"] = "incidentsCleared"
+    return resp
 
 
 def detect_provider_from_content(pdf_bytes: bytes, filename: str) -> str:
